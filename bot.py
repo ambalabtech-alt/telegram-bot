@@ -1596,8 +1596,26 @@ async def main():
     logger.info('Starting AmbaLab Bot...')
     asyncio.create_task(_midnight_scheduler())
     await dp.start_polling(bot)
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print('Bot stopped.')
+
+# --- Cloud Run entrypoint: HTTP server + aiogram polling ---
+import os
+import asyncio
+from aiohttp import web
+
+async def _health(request):
+    return web.Response(text="ok")
+
+async def _main():
+    # 1) HTTP-сервер для healthcheck-ів Cloud Run
+    app = web.Application()
+    app.add_routes([web.get("/", _health), web.get("/healthz", _health)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080")))
+    await site.start()
+
+    # 2) Запускаємо бота в режимі polling
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(_main())
