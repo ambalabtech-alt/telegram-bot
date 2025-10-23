@@ -1,17 +1,18 @@
-# Використовуємо офіційний Python-образ
+# Офіційний Python
 FROM python:3.11-slim
 
-# Встановлюємо робочу директорію
+# Робоча директорія
 WORKDIR /app
 
-# Копіюємо всі файли у контейнер
+# 1) Спочатку копіюємо ТІЛЬКИ requirements і ставимо залежності
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# 2) Потім копіюємо весь код
 COPY . .
 
-# Встановлюємо залежності
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Вказуємо порт (Cloud Run використовує $PORT)
+# Cloud Run слухає цей порт
 ENV PORT=8080
 
-# Запускаємо бота
-CMD exec python bot.py
+# Старт бота
+CMD ["python", "bot.py"]
