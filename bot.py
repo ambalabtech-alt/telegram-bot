@@ -1625,6 +1625,7 @@ async def _main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080")))
     await site.start()
+    asyncio.create_task(_midnight_scheduler())
 
     # 2) Запускаємо бота в режимі polling
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
