@@ -1197,7 +1197,19 @@ async def flow(msg: Message):
             try:
                 file = await bot.get_file(file_id_tg)
                 buf = await bot.download_file(file.file_path)
-                data = buf.read()
+                
+                # універсальне добування байтів: працює і з потоками, і з bytes
+                if hasattr(buf, 'read'):
+                    data = buf.read()
+                elif isinstance(buf, (bytes, bytearray)):
+                    data = bytes(buf)
+                else:
+                    import io
+                    bio = io.BytesIO()
+                    await bot.download_file(file.file_path, destination=bio)
+                    bio.seek(0)
+                    data = bio.getvalue()
+                
                 fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
                 _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
                 prev_link = get_cell(st.sheet_row, 'voice_link')
