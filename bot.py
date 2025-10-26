@@ -725,6 +725,7 @@ async def contact_tech(msg: Message):
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
+    await msg.answer("⏳ Перевіряю профіль лікаря. Зачекайте, будь ласка.")
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
     st = OrderState()
