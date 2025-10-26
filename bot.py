@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 from dotenv import load_dotenv
+from google.cloud import storage
 import re
 DATE_RE = re.compile('^(\\d{1,2})\\.(\\d{1,2})(?:\\.(\\d{2,4}))?$')
 NP_POSTOMAT_REF = 'f9316480-5f2d-425d-bc2c-ac7cd29decf0'
@@ -575,14 +576,64 @@ def share_anyone(file_id: str):
         logger.warning('Share-anyone failed: %s', e)
 
 async def upload_to_drive(st: OrderState, file_name: str, data: bytes, mime: Optional[str]) -> Tuple[str, str]:
+    """
+    Якщо STORAGE_BACKEND=gcs — зберігаємо у Google Cloud Storage і повертаємо (object_name, url).
+    Інакше працюємо по-старому через Google Drive і повертаємо (file_id, webViewLink).
+    """
+    backend = os.getenv("STORAGE_BACKEND", "drive").lower()
+
+    if backend == "gcs":
+        bucket_name = os.getenv("GCS_BUCKET")
+        if not bucket_name:
+            raise RuntimeError("GCS_BUCKET not configured")
+
+        from google.cloud import storage
+        import datetime
+
+        # Клієнт GCS під сервісним акаунтом Cloud Run
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+
+        # «Папка» замовлення всередині бакету
+        folder = f"{st.order_id}/"
+        object_name = folder + file_name
+
+        # Завантаження
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(
+            data,
+            content_type=(mime or "application/octet-stream")
+        )
+
+        # Формуємо посилання
+        if os.getenv("GCS_PUBLIC", "0") == "1":
+            url = f"https://storage.googleapis.com/{bucket_name}/{object_name}"
+        else:
+            ttl = int(os.getenv("GCS_SIGNED_URL_TTL", "86400"))
+            expires = datetime.timedelta(seconds=ttl)
+            url = blob.generate_signed_url(version="v4", expiration=expires, method="GET")
+
+        return object_name, url
+
+    # ------------ СТАРИЙ ШЛЯХ: ЗБЕРЕЖЕННЯ У GOOGLE DRIVE ------------
+    from googleapiclient.http import MediaIoBaseUpload
+
     await ensure_order_folder(st)
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime or 'application/octet-stream', resumable=False)
-    meta = {'name': file_name, 'parents': [st.drive_folder_id]}
-    f = drive.files().create(body=meta, media_body=media, fields='id,webViewLink').execute()
-    file_id, link = (f['id'], f.get('webViewLink', ''))
-    share_anyone(file_id)
-    st.drive_file_links.append(link)
-    return (file_id, link)
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype=(mime or "application/octet-stream"),
+        resumable=True
+    )
+    meta = {"name": file_name, "parents": [st.drive_folder_id]}
+
+    f = drive.files().create(
+        body=meta,
+        media_body=media,
+        fields="id,webViewLink"
+    ).execute()
+
+    share_anyone(f["id"])
+    return f["id"], f.get("webViewLink", "")
 NP_API_URL = 'https://api.novaposhta.ua/v2.0/json/'
 
 async def np_api_call(model: str, method: str, props: dict) -> dict:
