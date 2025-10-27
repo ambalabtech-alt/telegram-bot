@@ -80,14 +80,44 @@ async def _safe_append_row(values: Dict[str, str], msg) -> Optional[int]:
         await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
         return None
 
+async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str]) -> None:
+    """
+    Створює рядок замовлення у Sheets у фоні, щоби не блокувати чат.
+    """
+    try:
+        # append_row синхронний — виконуємо у пулі потоків, щоб не блокувати event-loop
+        row = await asyncio.to_thread(append_row, values)
+        st.sheet_row = row
+    except Exception:
+        logger.exception('Sheets append_row failed (bg)')
+        # Не валимо діалог — просто делікатно повідомляємо
+        try:
+            await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
+        except Exception:
+            pass
+
 async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
     try:
+        # Якщо рядок ще не готовий — дочекаємось появи sheet_row (до ~5 секунд)
+        if not row:
+            for _ in range(10):  # 10 * 0.5s = 5s
+                await asyncio.sleep(0.5)
+                st = state_by_chat.get(msg.chat.id)
+                row = (getattr(st, 'sheet_row', 0) or 0) if st else 0
+                if row:
+                    break
+        if not row:
+            await msg.answer("Секунду… зберігаю замовлення, спробуйте ще раз.")
+            return False
+
+        # set_cell синхронний; мінімальні зміни — залишаємо як є
         set_cell(row, col_name, value)
         return True
     except Exception:
         logger.exception('Sheets set_cell(%s) failed', col_name)
         await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
         return False
+        
 load_dotenv()
 BOOT_TS = int(time.time())
 ORDER_PREFIX = 'VZ'
@@ -734,11 +764,10 @@ async def new_order(msg: Message):
     state_by_chat[msg.chat.id] = st
     phone = doctor_phone_get(msg.chat.id)
     base_values = {'order_id': st.order_id, 'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
-    st.sheet_row = await _safe_append_row(base_values, msg)
-    if not st.sheet_row:
-        return
+    asyncio.create_task(_append_row_bg(msg, st, base_values))
+    
     if not phone:
-        await msg.answer('Вкажіть, будь ласка, Ваш номер телефону для звʼязку:', reply_markup=bottom_nav_kb())
+        await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
         st.step = 'doctor_phone'
     else:
         await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
