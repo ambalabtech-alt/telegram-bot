@@ -1685,9 +1685,15 @@ async def _midnight_scheduler():
 # ==== End helpers ====
 
 async def main():
-    logger.info('Starting AmbaLab Bot...')
-    asyncio.create_task(_midnight_scheduler())
-    await dp.start_polling(bot)
+    logger.info("Starting AmbaLab Bot...")
+    asyncio.create_task(midnight_scheduler())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        logger.warning("Stopping polling gracefully...")
+        await dp.stop_polling()
+        await bot.session.close()
+        logger.info("Bot shutdown complete.")
 
 # --- Cloud Run entrypoint: HTTP server + aiogram polling ---
 import os
