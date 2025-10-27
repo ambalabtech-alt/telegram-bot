@@ -725,52 +725,24 @@ async def contact_tech(msg: Message):
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
-    # 1) миттєвий фідбек користувачу
     await msg.answer("⏳ Перевіряю профіль лікаря. Зачекайте, будь ласка.")
-
-    # 2) як і було
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
-
-    # 3) зчитуємо телефон із Лист2 (швидка локальна операція)
+    st = OrderState()
+    st.order_id = gen_order_id()
+    st.email = LAB_EMAIL
+    state_by_chat[msg.chat.id] = st
     phone = doctor_phone_get(msg.chat.id)
-
-    # 4) одразу показуємо наступний крок
+    base_values = {'order_id': st.order_id, 'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
+    st.sheet_row = await _safe_append_row(base_values, msg)
+    if not st.sheet_row:
+        return
     if not phone:
-        await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
-        next_step = 'doctor_phone'
+        await msg.answer('Вкажіть, будь ласка, Ваш номер телефону для звʼязку:', reply_markup=bottom_nav_kb())
+        st.step = 'doctor_phone'
     else:
         await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
-        next_step = 'patient_lastname'
-
-async def _background_order_setup(msg: Message, phone: str, next_step: str):
-    """Фонова підготовка замовлення: order_id, базові поля, запис у Лист1, виставлення step."""
-    try:
-        st = OrderState()
-        st.order_id = gen_order_id()
-        st.email = LAB_EMAIL
-        state_by_chat[msg.chat.id] = st
-
-        base_values = {
-            'order_id': st.order_id,
-            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
-            'doctor_name': msg.from_user.full_name if msg.from_user else '',
-            'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '',
-            'chat_id': str(msg.chat.id),
-            'phone': phone,
-            'status': 'new'
-        }
-
-        st.sheet_row = await _safe_append_row(base_values, msg)
-        # Задаємо крок сценарію так само, як і раніше — згідно з тим,
-        # що ми показали користувачу вище (номер або прізвище)
-        st.step = next_step
-
-    except Exception as e:
-        logger.exception("Background order setup failed: %s", e)
-    
-    # 5) фоново запускаємо «важку» частину (order_id, запис у Лист1 тощо)
-    asyncio.create_task(_background_order_setup(msg, phone, next_step))
+        st.step = 'patient_lastname'
 
 async def ask_notes(msg: Message, st: OrderState):
     await msg.answer('Хочете додати текстові пояснення або голосове повідомлення?', reply_markup=notes_yesno_kb())
@@ -1685,15 +1657,9 @@ async def _midnight_scheduler():
 # ==== End helpers ====
 
 async def main():
-    logger.info("Starting AmbaLab Bot...")
-    asyncio.create_task(midnight_scheduler())
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        logger.warning("Stopping polling gracefully...")
-        await dp.stop_polling()
-        await bot.session.close()
-        logger.info("Bot shutdown complete.")
+    logger.info('Starting AmbaLab Bot...')
+    asyncio.create_task(_midnight_scheduler())
+    await dp.start_polling(bot)
 
 # --- Cloud Run entrypoint: HTTP server + aiogram polling ---
 import os
