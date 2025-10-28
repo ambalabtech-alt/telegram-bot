@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 google-api-python-client
 google-auth-httplib2
 google-cloud-storage>=2.16.0
+packaging>=24.0
