@@ -1593,6 +1593,50 @@ def _parse_created_at(s: str):
     except Exception:
         return None
 
+# === Retry helpers for Google Sheets (503/429) ===
+import asyncio
+import gspread
+
+async def _get_all_values_with_retry(ws, retries: int = 5, base_delay: int = 5, max_delay: int = 60):
+    """
+    Надійне читання всієї таблиці.
+    Ретраї на тимчасові збої Google API (503), з експоненційною паузою.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return ws.get_all_values()
+        except gspread.exceptions.APIError as e:
+            msg = str(e)
+            if ("503" in msg) or ("The service is currently unavailable" in msg):
+                if attempt < retries:
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                    logger.warning(f"Sheets 503 on get_all_values(); retry {attempt}/{retries} in {delay}s")
+                    await asyncio.sleep(delay)
+                    continue
+            # інші помилки (або остання спроба) — піднімаємо далі
+            raise
+
+async def _set_cell_with_retry(row: int, col_name: str, value: str,
+                               retries: int = 5, base_delay: int = 5, max_delay: int = 60):
+    """
+    Надійний запис у комірку.
+    Ретраї на 503/429 (квоти), з експоненційною паузою.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            set_cell(row, col_name, value)
+            return
+        except Exception as e:
+            s = str(e)
+            transient = ("503" in s) or ("429" in s) or ("Quota" in s) or ("temporarily" in s)
+            if transient and attempt < retries:
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                logger.warning(f"Sheets transient error on set_cell({row},{col_name}); retry {attempt}/{retries} in {delay}s")
+                await asyncio.sleep(delay)
+                continue
+            raise
+# === /Retry helpers ===
+
 async def _cancel_yesterdays_unfinished_orders():
     """
     На північ перевіряємо всі замовлення за попередню добу і
@@ -1604,7 +1648,7 @@ async def _cancel_yesterdays_unfinished_orders():
     yesterday = (now.date() - timedelta(days=1))
 
     # читаємо всю таблицю разом
-    all_vals = ws.get_all_values()
+    all_vals = await _get_all_values_with_retry(ws)
     if not all_vals:
         return
 
@@ -1634,7 +1678,7 @@ async def _cancel_yesterdays_unfinished_orders():
 
             # 1) проставити статус
             try:
-                set_cell(rownum, 'status', 'auto_cancelled')
+                await _set_cell_with_retry(rownum, 'status', 'auto_cancelled')
             except Exception:
                 logger.exception('Auto-cancel: failed to write status for row %s', rownum)
 
