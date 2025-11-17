@@ -462,7 +462,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🧾 Зробити замовлення'), KeyboardButton(text='📷 Instagram')], [KeyboardButton(text="☎️ Зв'язатися з техніком"), KeyboardButton(text='📂 Завантажити прайс')]], resize_keyboard=True)
 
 def files_method_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📁 Завантажити у бот (до 2Гб)')], [KeyboardButton(text='🔗 Надати посилання')], [KeyboardButton(text='✉️ Надіслати на e-mail')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📁 Завантажити у бот (до 2Гб)')], [KeyboardButton(text='🔗 Надати посилання')], [KeyboardButton(text='✉️ Надіслати на e-mail')], [KeyboardButton(text='Відбитки')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def done_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
@@ -693,9 +693,57 @@ def nz(v):
 
 def build_summary_text(st: OrderState) -> str:
     v = lambda name: get_cell(st.sheet_row, name)
-    files_map = {'telegram_upload': 'Завантаження у бот', 'link': 'Посилання', 'email': 'E-mail'}
-    files_human = files_map.get(v('files_method') or '', v('files_method') or '')
-    return f"Ваше замовлення № <b>{nz(st.order_id)}</b> прийнято.\n\nПацієнт: <b>{nz(v('patient_lastname'))}</b>\nВид робіт: <b>{nz(v('work_type'))}</b>\nДата здачі: <b>{nz(v('due_date'))}</b>\nСпосіб передачі файлів: <b>{files_human}</b>\n\nДоставка:\n— Місто: <b>{nz(v('np_city_name'))}</b>\n— Відділення/Поштомат: <b>{nz(v('np_warehouse_desc'))}</b>\n— Отримувач: <b>{nz(v('recipient_name'))}</b>\n\nДякуємо за співпрацю 🙂\nТехнік звʼяжеться з Вами найближчим часом."
+
+    # сирий вміст комірки
+    fm_raw = (v('files_method') or '').strip()
+
+    # мапа для "людських" назв
+    files_map = {
+        'telegram_upload': 'Завантаження у бот',
+        'link': 'Посилання',
+        'email': 'E-mail',
+        'Imprint': 'Відбитки',
+    }
+
+    # підтримка кількох методів через кому, але без зміни старої поведінки
+    if ',' in fm_raw:
+        parts = [p.strip() for p in fm_raw.split(',') if p.strip()]
+        human_parts = [files_map.get(p, p) for p in parts]
+        files_human = ', '.join(human_parts) if human_parts else fm_raw
+    else:
+        files_human = files_map.get(fm_raw or '', fm_raw or '')
+
+    base_text = (
+        f"Ваше замовлення № <b>{nz(st.order_id)}</b> прийнято.\n\n"
+        f"Пацієнт: <b>{nz(v('patient_lastname'))}</b>\n"
+        f"Вид робіт: <b>{nz(v('work_type'))}</b>\n"
+        f"Дата здачі: <b>{nz(v('due_date'))}</b>\n"
+        f"Спосіб передачі файлів: <b>{files_human}</b>\n\n"
+        f"Доставка:\n"
+        f"— Місто: <b>{nz(v('np_city_name'))}</b>\n"
+        f"— Відділення/Поштомат: <b>{nz(v('np_warehouse_desc'))}</b>\n"
+        f"— Отримувач: <b>{nz(v('recipient_name'))}</b>\n\n"
+        f"Дякуємо за співпрацю 🙂\n"
+        f"Технік звʼяжеться з Вами найближчим часом."
+    )
+
+    # 2. Додатковий блок ТІЛЬКИ якщо серед методів є Imprint
+    has_imprint = any(
+        p.strip() == 'Imprint'
+        for p in (fm_raw.split(',') if fm_raw else [])
+    ) or fm_raw == 'Imprint'
+
+    if has_imprint:
+        base_text += (
+            "\n\n"
+            "Відбитки надсилайте:\n\n"
+            "м. Одеса, 26 відділення\n"
+            "тел.: 38 093 410 90 73\n"
+            "Амбарцумян Вардгес"
+        )
+
+    return base_text
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -1208,6 +1256,10 @@ async def flow(msg: Message):
             text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
             await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
+            return
+        if 'Відбитки' in t:
+            append_files_method(st.sheet_row, 'Imprint')
+            await ask_notes(msg, st)
             return
         await _clear_inline_markup(msg)
         await _clear_inline_markup(msg)
