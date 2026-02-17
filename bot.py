@@ -1151,9 +1151,7 @@ async def flow(msg: Message):
             return
         st.due_date_iso = iso
         if not await _safe_set_cell(st.sheet_row, 'due_date', st.due_date_iso, msg): return
-        if not getattr(st, 'admin_notified', False):
-            await notify_admin_new_order(msg, st)
-            st.admin_notified = True
+            
         st.step = ''
         profiles = np_profiles_list(msg.chat.id)
         await _clear_inline_markup(msg)
