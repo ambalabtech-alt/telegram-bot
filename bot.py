@@ -1173,7 +1173,7 @@ async def flow(msg: Message):
         # не приймаємо дату раніше поточної
         today = now_kyiv().date()
         if d < today:
-            await msg.answer('Дата здачі не може бути в минулому. Вкажіть майбутню дату, напр. 22.02.2026.')
+            await msg.answer('Дата здачі не може бути в минулому. Вкажіть майбутню дату.')
             return
 
         st.due_date_iso = d.isoformat()
