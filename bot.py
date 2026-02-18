@@ -1164,21 +1164,31 @@ async def flow(msg: Message):
         await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
         return
-    d = parse_date_uk(msg.text or '')
-    if not d:
-        await msg.answer('Не можу розпізнати дату. Приклад: 05.10 або 10.10.2025.')
-        return
+    if st and st.step == 'due_date':
+        d = parse_date_uk(msg.text or '')
+        if not d:
+            await msg.answer('Не можу розпізнати дату. Приклад: 05.10 або 10.10.2026.')
+            return
 
-    st.due_date_iso = d.isoformat()      # ISO залишаємо для логіки та адмінки
-    ua = d.strftime('%d.%m.%Y')          # у таблицю пишемо український формат
+        # не приймаємо дату раніше поточної
+        today = now_kyiv().date()
+        if d < today:
+            await msg.answer('Дата здачі не може бути в минулому. Вкажіть майбутню дату, напр. 22.02.2026.')
+            return
 
-    if not await _safe_set_cell(st.sheet_row, 'due_date', ua, msg): 
-        return
-            
-        st.step = ''
+        st.due_date_iso = d.isoformat()
+        ua = d.strftime('%d.%m.%Y')
+
+        ok = await _safe_set_cell(st.sheet_row, 'due_date', ua, msg)
+        if not ok:
+            return
+
         profiles = np_profiles_list(msg.chat.id)
         await _clear_inline_markup(msg)
-        await msg.answer('Доставити замовлення Новою Поштою. Оберіть пункт меню:', reply_markup=np_menu_kb(has_saved=bool(profiles)))
+        await msg.answer(
+            'Доставити замовлення Новою Поштою. Оберіть пункт меню:',
+            reply_markup=np_menu_kb(has_saved=bool(profiles))
+        )
         st.step = 'np_menu'
         return
     if st and st.step == 'np_menu':
