@@ -542,14 +542,30 @@ def gen_order_id() -> str:
 def extract_urls(text: str) -> List[str]:
     return URL_RE.findall(text or '')
 
-def parse_date_uk(text: str) -> Optional[str]:
-    m = DATE_RE.match(text or '')
+def parse_date_uk(text: str) -> Optional[date]:
+    m = DATE_RE.match((text or '').strip())
     if not m:
         return None
+
     d, mth, y = m.groups()
-    y = y or str(date.today().year)
+
+    # поточний рік беремо у київському часі, не "як на сервері"
+    base_year = now_kyiv().date().year
+
+    if not y:
+        year = base_year
+    else:
+        y = y.strip()
+        # фікс: "26" -> 2026, а не рік 26
+        if len(y) == 2:
+            year = 2000 + int(y)
+        elif len(y) == 4:
+            year = int(y)
+        else:
+            return None
+
     try:
-        return date(int(y), int(mth), int(d)).strftime('%Y-%m-%d')
+        return date(year, int(mth), int(d))
     except Exception:
         return None
 
