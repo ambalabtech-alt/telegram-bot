@@ -1164,13 +1164,16 @@ async def flow(msg: Message):
         await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
         return
-    if st.step == 'due_date':
-        iso = parse_date_uk(msg.text or '')
-        if not iso:
-            await msg.answer('Не можу розпізнати дату. Приклад: 05.10 або 10.10.2025.')
-            return
-        st.due_date_iso = iso
-        if not await _safe_set_cell(st.sheet_row, 'due_date', st.due_date_iso, msg): return
+    d = parse_date_uk(msg.text or '')
+    if not d:
+        await msg.answer('Не можу розпізнати дату. Приклад: 05.10 або 10.10.2025.')
+        return
+
+    st.due_date_iso = d.isoformat()      # ISO залишаємо для логіки та адмінки
+    ua = d.strftime('%d.%m.%Y')          # у таблицю пишемо український формат
+
+    if not await _safe_set_cell(st.sheet_row, 'due_date', ua, msg): 
+        return
             
         st.step = ''
         profiles = np_profiles_list(msg.chat.id)
