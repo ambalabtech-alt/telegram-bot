@@ -831,7 +831,7 @@ async def new_order(msg: Message):
     st.email = LAB_EMAIL
     state_by_chat[msg.chat.id] = st
     phone = doctor_phone_get(msg.chat.id)
-    base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%Y-%m-%d %H:%M'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
+    base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
     asyncio.create_task(_append_row_bg(msg, st, base_values))
     
     if not phone:
