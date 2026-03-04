@@ -101,27 +101,68 @@ async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str])
             pass
 
 async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
-    try:
-        # Якщо рядок ще не готовий — дочекаємось появи sheet_row (до ~5 секунд)
-        if not row:
-            for _ in range(10):  # 10 * 0.5s = 5s
-                await asyncio.sleep(0.5)
-                st = state_by_chat.get(msg.chat.id)
-                row = (getattr(st, 'sheet_row', 0) or 0) if st else 0
-                if row:
-                    break
-        if not row:
-            await msg.answer("Секунду… зберігаю замовлення, спробуйте ще раз.")
-            return False
+    """Тихо і безпечно записує дані в Sheets.
 
-        # set_cell синхронний; мінімальні зміни — залишаємо як є
-        set_cell(row, col_name, value)
+    Якщо рядок ще не готовий або зсунувся (сортування/видалення),
+    ми НЕ зупиняємо сценарій і НЕ пишемо клієнту.
+    Запис відкладаємо і дозаписуємо, коли рядок стане доступним.
+    """
+    st = state_by_chat.get(msg.chat.id) if msg else None
+    if not st:
         return True
+
+    # Черга відкладених записів: список пар (col_name, value)
+    if not hasattr(st, "_pending_updates"):
+        st._pending_updates = []
+
+    # Якщо рядок ще не готовий - дочекаємось появи sheet_row (до ~5 секунд)
+    if not row:
+        for _ in range(10):  # 10 * 0.5s = 5s
+            await asyncio.sleep(0.5)
+            row = (getattr(st, 'sheet_row', 0) or 0)
+            if row:
+                break
+
+    # Якщо рядка досі немає - відкладаємо запис і йдемо далі
+    if not row:
+        st._pending_updates.append((col_name, value))
+        return True
+
+    # Перевіряємо, що поточний row досі належить цьому order_id
+    try:
+        current_oid = (get_cell(row, 'order_id') or '').strip()
+    except Exception:
+        current_oid = ''
+
+    if getattr(st, 'order_id', None) and current_oid != st.order_id:
+        new_row = find_row_by_order_id(st.order_id)
+        if new_row:
+            row = new_row
+            st.sheet_row = new_row
+        else:
+            # Якщо не знайшли рядок - відкладаємо запис
+            st._pending_updates.append((col_name, value))
+            return True
+
+    # Спочатку пробуємо злити відкладені записи
+    if getattr(st, "_pending_updates", None):
+        pending = st._pending_updates
+        st._pending_updates = []
+        for c, v in pending:
+            try:
+                set_cell(row, c, v)
+            except Exception:
+                logger.exception("Sheets: deferred set_cell failed (%s)", c)
+                st._pending_updates.append((c, v))
+
+    # Тепер пишемо поточне значення
+    try:
+        set_cell(row, col_name, value)
     except Exception:
         logger.exception('Sheets set_cell(%s) failed', col_name)
-        await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
-        return False
-        
+        st._pending_updates.append((col_name, value))
+
+    return True
 load_dotenv()
 BOOT_TS = int(time.time())
 ORDER_PREFIX = 'VZ'
@@ -187,6 +228,10 @@ def get_google_clients():
     return (gc, sh, ws, drive)
 gc, sh, ws, drive = get_google_clients()
 
+# --- Sheets order_id -> row cache (to speed up exact row lookup) ---
+ORDER_ROW_CACHE = {"ts": 0.0, "map": {}}
+ORDER_ROW_CACHE_TTL = 60  # seconds
+
 def append_files_method(row: int, method_key: str):
     """Append unique method keys to the existing 'files_method' column, comma-separated."""
     col = 'files_method'
@@ -210,14 +255,55 @@ def get_cell(row: int, col_name: str) -> str:
     col = headers_map(ws).get(col_name)
     return ws.cell(row, col).value if col else ''
 
+def find_row_by_order_id(order_id: str) -> int:
+    """Знаходимо рядок замовлення СТРОГО по order_id (повний збіг) лише в колонці order_id.
+
+    Оптимізація: використовуємо кеш (dict order_id -> row), щоб не читати колонку з Sheets на кожен запит.
+    """
+    if not order_id:
+        return 0
+
+    head = headers_map(ws)
+    col = head.get('order_id')
+    if not col:
+        return 0
+
+    try:
+        target = str(order_id).strip()
+        now = time.time()
+
+        # 1) Швидкий шлях: якщо кеш ще "свіжий" — повертаємо з кешу
+        if (now - ORDER_ROW_CACHE.get("ts", 0.0)) < ORDER_ROW_CACHE_TTL:
+            row = ORDER_ROW_CACHE.get("map", {}).get(target, 0)
+            if row:
+                return row
+
+        # 2) Оновлюємо кеш (читаємо ТІЛЬКИ колонку order_id)
+        vals = ws.col_values(col)  # 1..N
+        m = {}
+        for i, v in enumerate(vals, start=1):
+            key = str(v).strip()
+            if key:
+                m[key] = i  # якщо є дублікати — залишиться останній рядок
+
+        ORDER_ROW_CACHE["map"] = m
+        ORDER_ROW_CACHE["ts"] = now
+
+        return m.get(target, 0)
+
+    except Exception:
+        logger.exception("Sheets: find_row_by_order_id failed")
+        return 0
+
 def append_row(values: Dict[str, str]) -> int:
     head = headers_map(ws)
     row_dict = {**{h: '' for h in head.keys()}, **values}
     ws.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+    # invalidate cache so the next lookup sees the newly appended order_id
+    ORDER_ROW_CACHE["ts"] = 0.0
     order_id = values.get('order_id')
-    cell = ws.find(order_id) if order_id else None
-    return cell.row if cell else ws.row_count
-
+    row = find_row_by_order_id(order_id) if order_id else 0
+    return row if row else ws.row_count
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
