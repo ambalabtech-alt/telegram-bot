@@ -87,18 +87,27 @@ async def _safe_append_row(values: Dict[str, str], msg) -> Optional[int]:
 async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str]) -> None:
     """
     Створює рядок замовлення у Sheets у фоні, щоби не блокувати чат.
+    Робить кілька спроб, якщо Google Sheets тимчасово віддає SSL/мережеву помилку.
     """
-    try:
-        # append_row синхронний — виконуємо у пулі потоків, щоб не блокувати event-loop
-        row = await asyncio.to_thread(append_row, values)
-        st.sheet_row = row
-    except Exception:
-        logger.exception('Sheets append_row failed (bg)')
-        # Не валимо діалог — просто делікатно повідомляємо
+    last_error = None
+    for attempt in range(3):
         try:
-            await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
-        except Exception:
-            pass
+            # append_row синхронний — виконуємо у пулі потоків, щоб не блокувати event-loop
+            row = await asyncio.to_thread(append_row, values)
+            st.sheet_row = row
+            return
+        except Exception as e:
+            last_error = e
+            logger.exception('Sheets append_row failed (bg), attempt %s/3', attempt + 1)
+            if attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+
+    logger.error('Sheets append_row failed completely after retries: %s', last_error)
+    # Не валимо діалог — просто делікатно повідомляємо
+    try:
+        await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
+    except Exception:
+        pass
 
 async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
     """Тихо і безпечно записує дані в Sheets.
@@ -1900,7 +1909,7 @@ async def _midnight_scheduler():
 
 async def main():
     logger.info('Starting AmbaLab Bot...')
-    asyncio.create_task(_midnight_scheduler())
+    # asyncio.create_task(_midnight_scheduler())   # тимчасово вимкнули
     await dp.start_polling(bot)
 
 # --- Cloud Run entrypoint: HTTP server + aiogram polling ---
