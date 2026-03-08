@@ -730,11 +730,6 @@ async def _send_batch_ack_later(chat_id: int, order_id: str, step: str, version:
     if markup is None:
         return
     try:
-        try:
-            await bot.send_message(chat_id, '‎', reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
         await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=markup)
     except Exception:
         logger.exception('Batch ack send failed for step=%s chat_id=%s', step, chat_id)
@@ -851,20 +846,7 @@ def files_aux_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
 
 async def _refresh_reply_keyboard(msg: Message, reply_markup, text: str, parse_mode: Optional[str] = 'HTML') -> None:
-    """Примусово перевідкриває reply-клавіатуру в Telegram-клієнті.
-
-    Частина клієнтів після надсилання файла/тексту/посилання ховає клавіатуру
-    і не показує її знову, якщо просто надіслати чергове повідомлення з reply_markup.
-    Тому спочатку прибираємо клавіатуру, даємо коротку паузу, а потім показуємо нову.
-    """
-    try:
-        await msg.answer('‎', reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        pass
-    try:
-        await asyncio.sleep(0.2)
-    except Exception:
-        pass
+    """Відправляє повідомлення з клавіатурою без милиць із ReplyKeyboardRemove."""
     kwargs = {'reply_markup': reply_markup}
     if parse_mode:
         kwargs['parse_mode'] = parse_mode
