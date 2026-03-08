@@ -255,7 +255,7 @@ HEADERS_CACHE: Dict[str, Dict[str, int]] = {}
 
 def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
     if force or cache_key not in HEADERS_CACHE:
-        HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(ws_.row_values(1))}
+        HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(_retry_sheets(ws_.row_values, 1))}
     return HEADERS_CACHE[cache_key]
 
 def invalidate_headers_cache(cache_key: Optional[str] = None) -> None:
@@ -340,19 +340,49 @@ def np_profiles_ws():
 def np_head(ws_) -> Dict[str, int]:
     return get_headers_map(ws_, 'np_profiles_ws')
 
+def _is_retryable_sheets_error(e: Exception) -> bool:
+    s = str(e)
+    retry_markers = ('503', '429', 'Quota exceeded', 'timed out', 'UNAVAILABLE', 'Visibility check was unavailable', 'SSL')
+    return any(m in s for m in retry_markers)
+
+def _retry_sheets(fn, *args, retries: int = 3, base_delay: float = 1.0, **kwargs):
+    last = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if attempt >= retries - 1 or not _is_retryable_sheets_error(e):
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    raise last
+
 def bot_state_ws():
     try:
-        ws_state = sh.worksheet(BOT_STATE_SHEET_NAME)
+        ws_state = _retry_sheets(sh.worksheet, BOT_STATE_SHEET_NAME)
     except Exception:
-        ws_state = sh.add_worksheet(title=BOT_STATE_SHEET_NAME, rows=200, cols=25)
-        ws_state.update('A1:R1', [[
+        ws_state = _retry_sheets(sh.add_worksheet, title=BOT_STATE_SHEET_NAME, rows=200, cols=30)
+        _retry_sheets(ws_state.update, values=[[
             'chat_id', 'order_id', 'sheet_row', 'step', 'delivery_step',
             'patient_lastname', 'work_type', 'due_date_iso', 'np_city_ref',
             'np_warehouse_ref', 'offtopic_tries', 'seen_boot_ts',
             'files_done_pressed', 'file_tail_open', 'last_file_update_ts',
-            'file_tail_timeout_sec', 'files_batch_ack_version', 'updated_at'
-        ]])
+            'file_tail_timeout_sec', 'files_batch_ack_version', 'accepted_files_count',
+            'accepted_links_count', 'accepted_notes_count', 'updated_at'
+        ]], range_name='A1:U1')
         invalidate_headers_cache('bot_state_ws')
+    else:
+        head = get_headers_map(ws_state, 'bot_state_ws')
+        required = [
+            'chat_id', 'order_id', 'sheet_row', 'step', 'delivery_step', 'patient_lastname',
+            'work_type', 'due_date_iso', 'np_city_ref', 'np_warehouse_ref', 'offtopic_tries',
+            'seen_boot_ts', 'files_done_pressed', 'file_tail_open', 'last_file_update_ts',
+            'file_tail_timeout_sec', 'files_batch_ack_version', 'accepted_files_count',
+            'accepted_links_count', 'accepted_notes_count', 'updated_at'
+        ]
+        if any(col not in head for col in required):
+            _retry_sheets(ws_state.update, values=[required], range_name='A1:U1')
+            invalidate_headers_cache('bot_state_ws')
     return ws_state
 
 def bot_state_head() -> Dict[str, int]:
@@ -369,7 +399,7 @@ def save_bot_state(chat_id: int, st: 'OrderState') -> None:
     head = bot_state_head()
     target = str(chat_id)
     try:
-        row = ws_state.find(target).row
+        row = _retry_sheets(ws_state.find, target).row
     except Exception:
         row = 0
     values = {
@@ -390,26 +420,29 @@ def save_bot_state(chat_id: int, st: 'OrderState') -> None:
         'last_file_update_ts': str(getattr(st, 'last_file_update_ts', 0.0) or 0.0),
         'file_tail_timeout_sec': str(getattr(st, 'file_tail_timeout_sec', FILE_TAIL_TIMEOUT_SEC) or FILE_TAIL_TIMEOUT_SEC),
         'files_batch_ack_version': str(getattr(st, 'files_batch_ack_version', 0) or 0),
+        'accepted_files_count': str(getattr(st, 'accepted_files_count', 0) or 0),
+        'accepted_links_count': str(getattr(st, 'accepted_links_count', 0) or 0),
+        'accepted_notes_count': str(getattr(st, 'accepted_notes_count', 0) or 0),
         'updated_at': now_kyiv().strftime('%Y-%m-%d %H:%M:%S'),
     }
     if row:
         for k, v in values.items():
             c = head.get(k)
             if c:
-                ws_state.update_cell(row, c, v)
+                _retry_sheets(ws_state.update_cell, row, c, v)
     else:
         row_dict = {h: '' for h in head.keys()}
         row_dict.update(values)
-        ws_state.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+        _retry_sheets(ws_state.append_row, [row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
 
 def load_bot_state(chat_id: int) -> Optional['OrderState']:
     ws_state = bot_state_ws()
     head = bot_state_head()
     try:
-        row = ws_state.find(str(chat_id)).row
+        row = _retry_sheets(ws_state.find, str(chat_id)).row
     except Exception:
         return None
-    row_vals = ws_state.row_values(row)
+    row_vals = _retry_sheets(ws_state.row_values, row)
     def v(k: str) -> str:
         c = head.get(k)
         return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
@@ -430,16 +463,19 @@ def load_bot_state(chat_id: int) -> Optional['OrderState']:
     st.last_file_update_ts = float(v('last_file_update_ts') or 0.0)
     st.file_tail_timeout_sec = int(v('file_tail_timeout_sec') or FILE_TAIL_TIMEOUT_SEC)
     st.files_batch_ack_version = int(v('files_batch_ack_version') or 0)
+    st.accepted_files_count = int(v('accepted_files_count') or 0)
+    st.accepted_links_count = int(v('accepted_links_count') or 0)
+    st.accepted_notes_count = int(v('accepted_notes_count') or 0)
     return st
 
 def delete_bot_state(chat_id: int) -> None:
     ws_state = bot_state_ws()
     try:
-        row = ws_state.find(str(chat_id)).row
+        row = _retry_sheets(ws_state.find, str(chat_id)).row
     except Exception:
         return
     try:
-        ws_state.delete_rows(row)
+        _retry_sheets(ws_state.delete_rows, row)
     except Exception:
         pass
 
@@ -667,6 +703,10 @@ class OrderState:
     last_file_update_ts: float = 0.0
     file_tail_timeout_sec: int = FILE_TAIL_TIMEOUT_SEC
     files_batch_ack_version: int = 0
+    accepted_files_count: int = 0
+    accepted_links_count: int = 0
+    accepted_notes_count: int = 0
+    pending_links: List[str] = field(default_factory=list)
     finalized: bool = False
 state_by_chat: Dict[int, OrderState] = {}
 
@@ -684,17 +724,10 @@ def append_telegram_file_id_unique(row: int, file_id: str) -> str:
     return ' '.join(parts)
 
 async def schedule_files_batch_ack(msg: Message, order_id: str, ack_version: int) -> None:
-    await asyncio.sleep(FILES_BATCH_ACK_DELAY_SEC)
-    st = state_by_chat.get(msg.chat.id)
-    if not st or st.order_id != order_id:
-        return
-    if st.step != 'await_tele_files' or st.files_done_pressed:
-        return
-    if st.files_batch_ack_version != ack_version:
-        return
-    if time.time() - st.last_file_update_ts < FILES_BATCH_ACK_DELAY_SEC:
-        return
-    await msg.answer('✅ Ваші файли отримані і збережені', reply_markup=files_aux_kb())
+    return
+
+async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
+    return await asyncio.to_thread(append_telegram_file_id_unique, row, file_id)
 
 async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = False, is_tail: bool = False) -> bool:
     if not FILES_CHANNEL_ID:
@@ -702,35 +735,50 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
             await msg.answer('⚠️ FILES_CHANNEL_ID не налаштований у .env')
         return False
     caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
+    if msg.content_type == ContentType.DOCUMENT:
+        if msg.document.file_size and msg.document.file_size > 2 * 1024 * 1024 * 1024:
+            if not silent:
+                await msg.answer('❌ Файл більший за 2 ГБ. Оберіть інший спосіб.', reply_markup=files_aux_kb())
+            return False
+        file_id = msg.document.file_id
+    else:
+        file_id = msg.photo[-1].file_id
+
+    if file_id not in st.telegram_file_ids:
+        st.telegram_file_ids.append(file_id)
+        st.accepted_files_count += 1
+    st.last_file_update_ts = time.time()
+    if is_tail:
+        st.file_tail_open = True
+
     try:
         if msg.content_type == ContentType.DOCUMENT:
-            if msg.document.file_size and msg.document.file_size > 2 * 1024 * 1024 * 1024:
-                if not silent:
-                    await msg.answer('❌ Файл більший за 2 ГБ. Оберіть інший спосіб.', reply_markup=files_aux_kb())
-                return False
-            file_id = msg.document.file_id
             await bot.send_document(FILES_CHANNEL_ID, file_id, caption=caption)
         else:
-            file_id = msg.photo[-1].file_id
             await bot.send_photo(FILES_CHANNEL_ID, file_id, caption=caption)
-
-        if file_id not in st.telegram_file_ids:
-            st.telegram_file_ids.append(file_id)
-        append_telegram_file_id_unique(st.sheet_row, file_id)
-        set_cell(st.sheet_row, 'status', 'files_received')
-        st.last_file_update_ts = time.time()
-        if is_tail:
-            st.file_tail_open = True
-        elif not st.files_done_pressed:
-            st.files_batch_ack_version += 1
-            asyncio.create_task(schedule_files_batch_ack(msg, st.order_id, st.files_batch_ack_version))
-        await save_bot_state_async(msg.chat.id, st)
-        return True
     except Exception:
         logger.exception('Send to channel failed')
-        if not silent:
+        if not silent and not is_tail:
             await msg.answer("Не можу зберегти файл. Тимчасові складності зі зв'язком. Спробуйте пізніше.", reply_markup=files_aux_kb())
         return False
+
+    async def _post_save_best_effort():
+        try:
+            for attempt in range(3):
+                try:
+                    await _append_telegram_file_id_unique_async(st.sheet_row, file_id)
+                    await asyncio.to_thread(set_cell, st.sheet_row, 'status', 'files_received')
+                    break
+                except Exception:
+                    logger.exception('files_telegram_id write failed, attempt %s/3', attempt + 1)
+                    if attempt < 2:
+                        await asyncio.sleep(1 * (2 ** attempt))
+            await save_bot_state_async(msg.chat.id, st)
+        except Exception:
+            logger.exception('post file save best-effort failed')
+
+    asyncio.create_task(_post_save_best_effort())
+    return True
 
 async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
     """Мʼяко попереджає, на 3-й раз відправляє в Головне меню. Повертає True, якщо щось зроблено."""
@@ -1134,6 +1182,9 @@ async def new_order(msg: Message):
     st = OrderState()
     st.order_id = gen_order_id()
     st.email = LAB_EMAIL
+    st.accepted_files_count = 0
+    st.accepted_links_count = 0
+    st.accepted_notes_count = 0
     state_by_chat[msg.chat.id] = st
     await save_bot_state_async(msg.chat.id, st)
     phone = doctor_phone_get(msg.chat.id)
@@ -1289,7 +1340,7 @@ async def flow(msg: Message):
                 return
 
             else:
-                reprompt_map = {'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()), 'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()), 'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()), 'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()), 'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))), 'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()), 'await_tele_files': ('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', files_aux_kb()), 'await_links': ('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nНадсилайте по одному в повідомленні — я відповім:\n«✅ Посилання збережено».\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', files_aux_kb()), 'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()), 'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення?', notes_yesno_kb()), 'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', done_kb())}
+                reprompt_map = {'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()), 'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()), 'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()), 'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()), 'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))), 'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()), 'await_tele_files': ('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', files_aux_kb()), 'await_links': ('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', files_aux_kb()), 'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()), 'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення?', notes_yesno_kb()), 'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', done_kb())}
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
                 resp = await msg.answer(hint, reply_markup=kb, parse_mode='HTML')
             st = state_by_chat.get(msg.chat.id)
@@ -1318,8 +1369,10 @@ async def flow(msg: Message):
         return
     if st and st.step == 'await_notes_choice':
         choice = (msg.text or '').strip()
+        if choice == '✅ Готово':
+            return
         if choice == 'Так':
-            await msg.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
+            await msg.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
             st.step = 'await_notes'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -1593,13 +1646,16 @@ async def flow(msg: Message):
             st.file_tail_open = False
             st.last_file_update_ts = 0.0
             st.files_batch_ack_version = 0
+            st.accepted_files_count = 0
             await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
             await save_bot_state_async(msg.chat.id, st)
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
-            await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nНадсилайте по одному в повідомленні — я відповім:\n«✅ Посилання збережено».\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
+            st.accepted_links_count = 0
+            st.pending_links = []
+            await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_links'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -1622,10 +1678,9 @@ async def flow(msg: Message):
         await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         return
-        return
     if st.step == 'await_links':
         if (msg.text or '').strip() == '✅ Готово':
-            if not (get_cell(st.sheet_row, 'links_external') or '').strip():
+            if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -1635,13 +1690,25 @@ async def flow(msg: Message):
         if not urls:
             await msg.answer('Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
             return
-        update_joined(st.sheet_row, 'links_external', urls)
-        set_cell(st.sheet_row, 'status', 'files_received')
-        await msg.answer('✅ Посилання збережено.', reply_markup=files_aux_kb())
+        new_urls = []
+        for u in urls:
+            if u not in st.pending_links:
+                st.pending_links.append(u)
+                st.accepted_links_count += 1
+                new_urls.append(u)
+        async def _save_links_best_effort(urls_to_save: List[str]):
+            try:
+                if urls_to_save:
+                    await asyncio.to_thread(update_joined, st.sheet_row, 'links_external', urls_to_save)
+                    await asyncio.to_thread(set_cell, st.sheet_row, 'status', 'files_received')
+                await save_bot_state_async(msg.chat.id, st)
+            except Exception:
+                logger.exception('links best-effort save failed')
+        asyncio.create_task(_save_links_best_effort(new_urls))
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
-            if not (get_cell(st.sheet_row, 'files_telegram_id') or '').strip():
+            if st.accepted_files_count <= 0 and not st.telegram_file_ids:
                 await msg.answer('Поки що файлів не додано. Надішліть хоча б один або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -1666,37 +1733,43 @@ async def flow(msg: Message):
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
-            prev = get_cell(st.sheet_row, 'voice_id')
-            set_cell(st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
-            try:
-                file = await bot.get_file(file_id_tg)
-                buf = await bot.download_file(file.file_path)
-                
-                # універсальне добування байтів: працює і з потоками, і з bytes
-                if hasattr(buf, 'read'):
-                    data = buf.read()
-                elif isinstance(buf, (bytes, bytearray)):
-                    data = bytes(buf)
-                else:
-                    import io
-                    bio = io.BytesIO()
-                    await bot.download_file(file.file_path, destination=bio)
-                    bio.seek(0)
-                    data = bio.getvalue()
-                
-                fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
-                _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
-                prev_link = get_cell(st.sheet_row, 'voice_link')
-                set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
-                await msg.answer('✅ Голосове повідомлення збережено.', reply_markup=done_kb())
-            except Exception as e:
-                logger.exception('Voice upload error')
-                await msg.answer("Не можу зберегти файл. Тимчасові складності зі зв'язком. Спробуйте пізніше.", reply_markup=done_kb())
+            st.accepted_notes_count += 1
+            async def _save_voice_best_effort():
+                try:
+                    prev = get_cell(st.sheet_row, 'voice_id')
+                    set_cell(st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
+                    file = await bot.get_file(file_id_tg)
+                    buf = await bot.download_file(file.file_path)
+                    if hasattr(buf, 'read'):
+                        data = buf.read()
+                    elif isinstance(buf, (bytes, bytearray)):
+                        data = bytes(buf)
+                    else:
+                        import io
+                        bio = io.BytesIO()
+                        await bot.download_file(file.file_path, destination=bio)
+                        bio.seek(0)
+                        data = bio.getvalue()
+                    fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
+                    _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
+                    prev_link = get_cell(st.sheet_row, 'voice_link')
+                    set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
+                    await save_bot_state_async(msg.chat.id, st)
+                except Exception:
+                    logger.exception('Voice upload error')
+            asyncio.create_task(_save_voice_best_effort())
             return
         if msg.text:
-            prev = get_cell(st.sheet_row, 'notes')
-            set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + (msg.text or ''))
-            await msg.answer('✅ Текстове повідомлення збережено.', reply_markup=done_kb())
+            st.accepted_notes_count += 1
+            note_text = (msg.text or '')
+            async def _save_note_best_effort():
+                try:
+                    prev = get_cell(st.sheet_row, 'notes')
+                    set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
+                    await save_bot_state_async(msg.chat.id, st)
+                except Exception:
+                    logger.exception('notes best-effort save failed')
+            asyncio.create_task(_save_note_best_effort())
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
@@ -1730,8 +1803,9 @@ def np_detect_kind(s: str):
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
     st = state_by_chat.get(q.message.chat.id)
-    await msg.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
+    await q.message.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
     st.step = 'await_notes'
+    await save_bot_state_async(q.message.chat.id, st)
     await q.answer()
 
 @dp.callback_query(F.data == 'notes_no')
