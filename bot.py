@@ -804,7 +804,11 @@ async def _refresh_done_keyboard(msg: Message, text: str = 'Можете над�
         await msg.answer('‎', reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
-    await msg.answer(text, reply_markup=done_kb())
+    try:
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+    await msg.answer(text, reply_markup=done_kb(), parse_mode='HTML')
 NP_MENU_ADD = '✏️ Додати нову адресу'
 NP_MENU_USE_SAVED = '📦 На збережену адресу'
 NP_MENU_SKIP = '⏭️ Пропустити'
@@ -1361,7 +1365,7 @@ async def flow(msg: Message):
         if choice == '✅ Готово':
             return
         if choice == 'Так':
-            await msg.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
+            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
             st.step = 'await_notes'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -1792,7 +1796,7 @@ def np_detect_kind(s: str):
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
     st = state_by_chat.get(q.message.chat.id)
-    await q.message.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
+    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
     st.step = 'await_notes'
     await save_bot_state_async(q.message.chat.id, st)
     await q.answer()
