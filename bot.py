@@ -429,9 +429,11 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         elif 'email' in files_method and not rv('email_sent'):
             st.step = 'email_wait_done'
         elif not (notes.strip() or voice.strip()):
+            # No notes or voice yet – prompt the doctor whether they want to add any
             st.step = 'await_notes_choice'
         else:
-            st.step = 'await_notes_choice'
+            # Notes or voice messages already exist – stay in await_notes so the doctor can add more or press Done
+            st.step = 'await_notes'
         return st
     except Exception:
         logger.exception('Order restore from sheet failed')
