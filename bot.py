@@ -2,7 +2,6 @@ import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
 import os, io, asyncio, logging, re
-import re
 URL_RE = re.compile('(?i)\\b((?:https?|ftp)://[^\\s<>]+|www\\.[^\\s<>]+|[a-z0-9.-]+\\.[a-z]{2,}[^\\s<>]*)')
 
 def extract_urls(text: str):
@@ -19,7 +18,6 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 from dotenv import load_dotenv
 from google.cloud import storage
-import re
 DATE_RE = re.compile('^(\\d{1,2})\\.(\\d{1,2})(?:\\.(\\d{2,4}))?$')
 NP_POSTOMAT_REF = 'f9316480-5f2d-425d-bc2c-ac7cd29decf0'
 from aiogram import Bot, Dispatcher, F
@@ -53,7 +51,6 @@ async def _clear_inline_markup(msg: Message) -> None:
         await msg.bot.edit_message_reply_markup(chat_id=msg.chat.id, message_id=msg.message_id, reply_markup=None)
     except Exception:
         pass
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ContentType, ReplyKeyboardRemove
 import aiohttp
 import gspread
 from googleapiclient.discovery import build
@@ -193,6 +190,10 @@ assert OAUTH_CLIENT_SECRETS_JSON and os.path.exists(OAUTH_CLIENT_SECRETS_JSON), 
 assert NOVAPOSHTA_API_KEY, 'NOVAPOSHTA_API_KEY is empty'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/view?usp=drive_link'
+FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
+FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '3'))
+BOT_STATE_SHEET_NAME = os.getenv('BOT_STATE_SHEET_NAME', '_bot_state')
+
 
 def get_creds():
     """
@@ -250,8 +251,22 @@ def append_files_method(row: int, method_key: str):
         parts.append(method_key)
         set_cell(row, col, ', '.join(parts))
 
+HEADERS_CACHE: Dict[str, Dict[str, int]] = {}
+
+def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
+    if force or cache_key not in HEADERS_CACHE:
+        HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(ws_.row_values(1))}
+    return HEADERS_CACHE[cache_key]
+
+def invalidate_headers_cache(cache_key: Optional[str] = None) -> None:
+    if cache_key is None:
+        HEADERS_CACHE.clear()
+    else:
+        HEADERS_CACHE.pop(cache_key, None)
+
 def headers_map(ws_) -> Dict[str, int]:
-    return {name.strip(): idx + 1 for idx, name in enumerate(ws_.row_values(1))}
+    cache_key = 'main_ws' if ws_ == ws else f'ws_{id(ws_)}'
+    return get_headers_map(ws_, cache_key)
 
 def set_cell(row: int, col_name: str, value):
     col = headers_map(ws).get(col_name)
@@ -323,7 +338,119 @@ def np_profiles_ws():
     return sh.worksheet('Лист2')
 
 def np_head(ws_) -> Dict[str, int]:
-    return {h.strip(): i + 1 for i, h in enumerate(ws_.row_values(1))}
+    return get_headers_map(ws_, 'np_profiles_ws')
+
+def bot_state_ws():
+    try:
+        ws_state = sh.worksheet(BOT_STATE_SHEET_NAME)
+    except Exception:
+        ws_state = sh.add_worksheet(title=BOT_STATE_SHEET_NAME, rows=200, cols=25)
+        ws_state.update('A1:R1', [[
+            'chat_id', 'order_id', 'sheet_row', 'step', 'delivery_step',
+            'patient_lastname', 'work_type', 'due_date_iso', 'np_city_ref',
+            'np_warehouse_ref', 'offtopic_tries', 'seen_boot_ts',
+            'files_done_pressed', 'file_tail_open', 'last_file_update_ts',
+            'file_tail_timeout_sec', 'files_batch_ack_version', 'updated_at'
+        ]])
+        invalidate_headers_cache('bot_state_ws')
+    return ws_state
+
+def bot_state_head() -> Dict[str, int]:
+    return get_headers_map(bot_state_ws(), 'bot_state_ws')
+
+def _bool_to_str(v: bool) -> str:
+    return '1' if v else '0'
+
+def _str_to_bool(v: str) -> bool:
+    return str(v).strip() in ('1', 'true', 'True', 'yes', 'Yes')
+
+def save_bot_state(chat_id: int, st: 'OrderState') -> None:
+    ws_state = bot_state_ws()
+    head = bot_state_head()
+    target = str(chat_id)
+    try:
+        row = ws_state.find(target).row
+    except Exception:
+        row = 0
+    values = {
+        'chat_id': target,
+        'order_id': st.order_id or '',
+        'sheet_row': str(st.sheet_row or 0),
+        'step': st.step or '',
+        'delivery_step': st.delivery_step or '',
+        'patient_lastname': st.patient_lastname or '',
+        'work_type': st.work_type or '',
+        'due_date_iso': st.due_date_iso or '',
+        'np_city_ref': st.np_city_ref or '',
+        'np_warehouse_ref': st.np_warehouse_ref or '',
+        'offtopic_tries': str(st.offtopic_tries or 0),
+        'seen_boot_ts': str(st.seen_boot_ts or 0),
+        'files_done_pressed': _bool_to_str(getattr(st, 'files_done_pressed', False)),
+        'file_tail_open': _bool_to_str(getattr(st, 'file_tail_open', False)),
+        'last_file_update_ts': str(getattr(st, 'last_file_update_ts', 0.0) or 0.0),
+        'file_tail_timeout_sec': str(getattr(st, 'file_tail_timeout_sec', FILE_TAIL_TIMEOUT_SEC) or FILE_TAIL_TIMEOUT_SEC),
+        'files_batch_ack_version': str(getattr(st, 'files_batch_ack_version', 0) or 0),
+        'updated_at': now_kyiv().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    if row:
+        for k, v in values.items():
+            c = head.get(k)
+            if c:
+                ws_state.update_cell(row, c, v)
+    else:
+        row_dict = {h: '' for h in head.keys()}
+        row_dict.update(values)
+        ws_state.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+
+def load_bot_state(chat_id: int) -> Optional['OrderState']:
+    ws_state = bot_state_ws()
+    head = bot_state_head()
+    try:
+        row = ws_state.find(str(chat_id)).row
+    except Exception:
+        return None
+    row_vals = ws_state.row_values(row)
+    def v(k: str) -> str:
+        c = head.get(k)
+        return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
+    st = OrderState()
+    st.order_id = v('order_id')
+    st.sheet_row = int(v('sheet_row') or 0)
+    st.step = v('step')
+    st.delivery_step = v('delivery_step')
+    st.patient_lastname = v('patient_lastname')
+    st.work_type = v('work_type')
+    st.due_date_iso = v('due_date_iso')
+    st.np_city_ref = v('np_city_ref')
+    st.np_warehouse_ref = v('np_warehouse_ref')
+    st.offtopic_tries = int(v('offtopic_tries') or 0)
+    st.seen_boot_ts = int(v('seen_boot_ts') or 0)
+    st.files_done_pressed = _str_to_bool(v('files_done_pressed'))
+    st.file_tail_open = _str_to_bool(v('file_tail_open'))
+    st.last_file_update_ts = float(v('last_file_update_ts') or 0.0)
+    st.file_tail_timeout_sec = int(v('file_tail_timeout_sec') or FILE_TAIL_TIMEOUT_SEC)
+    st.files_batch_ack_version = int(v('files_batch_ack_version') or 0)
+    return st
+
+def delete_bot_state(chat_id: int) -> None:
+    ws_state = bot_state_ws()
+    try:
+        row = ws_state.find(str(chat_id)).row
+    except Exception:
+        return
+    try:
+        ws_state.delete_rows(row)
+    except Exception:
+        pass
+
+async def save_bot_state_async(chat_id: int, st: 'OrderState') -> None:
+    await asyncio.to_thread(save_bot_state, chat_id, st)
+
+async def load_bot_state_async(chat_id: int) -> Optional['OrderState']:
+    return await asyncio.to_thread(load_bot_state, chat_id)
+
+async def delete_bot_state_async(chat_id: int) -> None:
+    await asyncio.to_thread(delete_bot_state, chat_id)
 
 def np_profile_get(chat_id: int) -> dict:
     ws2 = np_profiles_ws()
@@ -535,7 +662,75 @@ class OrderState:
     np_warehouse_ref: str = ''
     offtopic_tries: int = 0
     seen_boot_ts: int = 0
+    files_done_pressed: bool = False
+    file_tail_open: bool = False
+    last_file_update_ts: float = 0.0
+    file_tail_timeout_sec: int = FILE_TAIL_TIMEOUT_SEC
+    files_batch_ack_version: int = 0
+    finalized: bool = False
 state_by_chat: Dict[int, OrderState] = {}
+
+def refresh_file_tail_state(st: 'OrderState') -> None:
+    if getattr(st, 'file_tail_open', False) and getattr(st, 'last_file_update_ts', 0.0):
+        if time.time() - st.last_file_update_ts >= (getattr(st, 'file_tail_timeout_sec', FILE_TAIL_TIMEOUT_SEC) or FILE_TAIL_TIMEOUT_SEC):
+            st.file_tail_open = False
+
+def append_telegram_file_id_unique(row: int, file_id: str) -> str:
+    prev = (get_cell(row, 'files_telegram_id') or '').strip()
+    parts = [p.strip() for p in prev.split() if p.strip()]
+    if file_id not in parts:
+        parts.append(file_id)
+        set_cell(row, 'files_telegram_id', ' '.join(parts))
+    return ' '.join(parts)
+
+async def schedule_files_batch_ack(msg: Message, order_id: str, ack_version: int) -> None:
+    await asyncio.sleep(FILES_BATCH_ACK_DELAY_SEC)
+    st = state_by_chat.get(msg.chat.id)
+    if not st or st.order_id != order_id:
+        return
+    if st.step != 'await_tele_files' or st.files_done_pressed:
+        return
+    if st.files_batch_ack_version != ack_version:
+        return
+    if time.time() - st.last_file_update_ts < FILES_BATCH_ACK_DELAY_SEC:
+        return
+    await msg.answer('✅ Ваші файли отримані і збережені', reply_markup=files_aux_kb())
+
+async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = False, is_tail: bool = False) -> bool:
+    if not FILES_CHANNEL_ID:
+        if not silent:
+            await msg.answer('⚠️ FILES_CHANNEL_ID не налаштований у .env')
+        return False
+    caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
+    try:
+        if msg.content_type == ContentType.DOCUMENT:
+            if msg.document.file_size and msg.document.file_size > 2 * 1024 * 1024 * 1024:
+                if not silent:
+                    await msg.answer('❌ Файл більший за 2 ГБ. Оберіть інший спосіб.', reply_markup=files_aux_kb())
+                return False
+            file_id = msg.document.file_id
+            await bot.send_document(FILES_CHANNEL_ID, file_id, caption=caption)
+        else:
+            file_id = msg.photo[-1].file_id
+            await bot.send_photo(FILES_CHANNEL_ID, file_id, caption=caption)
+
+        if file_id not in st.telegram_file_ids:
+            st.telegram_file_ids.append(file_id)
+        append_telegram_file_id_unique(st.sheet_row, file_id)
+        set_cell(st.sheet_row, 'status', 'files_received')
+        st.last_file_update_ts = time.time()
+        if is_tail:
+            st.file_tail_open = True
+        elif not st.files_done_pressed:
+            st.files_batch_ack_version += 1
+            asyncio.create_task(schedule_files_batch_ack(msg, st.order_id, st.files_batch_ack_version))
+        await save_bot_state_async(msg.chat.id, st)
+        return True
+    except Exception:
+        logger.exception('Send to channel failed')
+        if not silent:
+            await msg.answer("Не можу зберегти файл. Тимчасові складності зі зв'язком. Спробуйте пізніше.", reply_markup=files_aux_kb())
+        return False
 
 async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
     """Мʼяко попереджає, на 3-й раз відправляє в Головне меню. Повертає True, якщо щось зроблено."""
@@ -552,6 +747,7 @@ async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
                 pass
         await msg.answer("Бачу, що ми відхиляємось від сценарію. Повертаю у Головне меню.", reply_markup=main_kb())
         state_by_chat[msg.chat.id] = OrderState()
+        await delete_bot_state_async(msg.chat.id)
         return True
     await msg.answer("Будь ласка, притримуйтесь сценарію оформлення замовлення.", reply_markup=bottom_nav_kb())
     return True
@@ -784,10 +980,22 @@ NP_API_URL = 'https://api.novaposhta.ua/v2.0/json/'
 async def np_api_call(model: str, method: str, props: dict) -> dict:
     payload = {'apiKey': NOVAPOSHTA_API_KEY, 'modelName': model, 'calledMethod': method, 'methodProperties': props or {}}
     timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.post(NP_API_URL, json=payload) as r:
-            r.raise_for_status()
-            return await r.json()
+    last_error = None
+    for attempt, delay in enumerate((0, 1, 2, 4), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(NP_API_URL, json=payload) as r:
+                    if r.status >= 500:
+                        raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message='NP 5xx', headers=r.headers)
+                    r.raise_for_status()
+                    return await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt >= 4:
+                raise
+    raise last_error
 
 async def np_search_cities(query: str, limit: int=10) -> list:
     resp = await np_api_call('Address', 'getCities', {'FindByString': query, 'Page': '1', 'Limit': str(limit)})
@@ -875,12 +1083,14 @@ async def notify_admin_new_order(msg: Message, st: OrderState):
 async def start(msg: Message):
     await _clear_inline_markup(msg)
     state_by_chat[msg.chat.id] = OrderState()
+    await delete_bot_state_async(msg.chat.id)
     await msg.answer('Вітаємо! Це бот AmbaLab. Натисніть «🧾 Зробити замовлення», щоб розпочати.', reply_markup=main_kb())
 
 @dp.message(F.text == '/menu')
 async def menu_cmd(msg: Message):
     await _clear_inline_markup(msg)
     state_by_chat[msg.chat.id] = state_by_chat.get(msg.chat.id, OrderState())
+    await save_bot_state_async(msg.chat.id, state_by_chat[msg.chat.id])
     await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
 
 @dp.message(F.text == '📷 Instagram')
@@ -925,6 +1135,7 @@ async def new_order(msg: Message):
     st.order_id = gen_order_id()
     st.email = LAB_EMAIL
     state_by_chat[msg.chat.id] = st
+    await save_bot_state_async(msg.chat.id, st)
     phone = doctor_phone_get(msg.chat.id)
     base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
     asyncio.create_task(_append_row_bg(msg, st, base_values))
@@ -932,13 +1143,16 @@ async def new_order(msg: Message):
     if not phone:
         await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
         st.step = 'doctor_phone'
+        await save_bot_state_async(msg.chat.id, st)
     else:
         await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
         st.step = 'patient_lastname'
+        await save_bot_state_async(msg.chat.id, st)
 
 async def ask_notes(msg: Message, st: OrderState):
     await msg.answer('Хочете додати текстові пояснення або голосове повідомлення?', reply_markup=notes_yesno_kb())
     st.step = 'await_notes_choice'
+    await save_bot_state_async(msg.chat.id, st)
 
 async def finalize_order(msg: Message, st: OrderState):
     if getattr(st, 'finalized', False):
@@ -952,9 +1166,18 @@ async def finalize_order(msg: Message, st: OrderState):
 
     await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
     state_by_chat[msg.chat.id] = OrderState()
+    await delete_bot_state_async(msg.chat.id)
 
 @dp.message()
 async def flow(msg: Message):
+    st = state_by_chat.get(msg.chat.id)
+    if not st:
+        st = await load_bot_state_async(msg.chat.id)
+        if st:
+            state_by_chat[msg.chat.id] = st
+    if st:
+        refresh_file_tail_state(st)
+
     # Додатковий захист: URL/посилання поза сценарієм — також у Головне меню
     if msg.content_type == 'text':
         txt = (msg.text or '').strip()
@@ -971,22 +1194,23 @@ async def flow(msg: Message):
                         pass
                 await msg.answer('Повертаємось у Головне меню. Спробуйте ще раз.', reply_markup=main_kb())
                 state_by_chat[msg.chat.id] = OrderState()
+                await delete_bot_state_async(msg.chat.id)
                 return
     # Жорсткий захист: будь-який неочікуваний НЕ-текст → Головне меню
     st = state_by_chat.get(msg.chat.id)
     if msg.content_type != 'text':
         expecting_file = st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
         expecting_voice = st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE
-        if not (expecting_file or expecting_voice):
-            if st and getattr(st, 'sheet_row', None):
-                try:
-                    set_cell(st.sheet_row, 'status', 'cancelled')
-                except Exception:
-                    pass
+        tail_file_allowed = st and st.file_tail_open and st.step != 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
+        if not (expecting_file or expecting_voice or tail_file_allowed):
+            if st is not None:
+                handled = await _warn_or_reset_to_menu(msg, st)
+                if handled:
+                    return
             await msg.answer('Повертаємось у Головне меню. Спробуйте ще раз.', reply_markup=main_kb())
             state_by_chat[msg.chat.id] = OrderState()
+            await delete_bot_state_async(msg.chat.id)
             return
-    st = state_by_chat.get(msg.chat.id)
     st = state_by_chat.get(msg.chat.id)
     await _clear_inline_markup(msg)
     if (msg.text or '').strip() in MAIN_BTNS:
@@ -997,6 +1221,7 @@ async def flow(msg: Message):
         st.confirm_exit = False
         if st and st.step in ('await_tele_files', 'await_links', 'email_wait_done'):
             st.step = 'choose_files_method'
+            await save_bot_state_async(msg.chat.id, st)
             await msg.answer('Повернулись до вибору способу передачі файлів:', reply_markup=files_method_kb())
             return
         if not st:
@@ -1042,6 +1267,7 @@ async def flow(msg: Message):
                 except Exception:
                     pass
             state_by_chat[msg.chat.id] = OrderState()
+            await delete_bot_state_async(msg.chat.id)
             await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
             return
         if text == 'Ні, продовжити':
@@ -1063,7 +1289,7 @@ async def flow(msg: Message):
                 return
 
             else:
-                reprompt_map = {'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()), 'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()), 'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()), 'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()), 'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))), 'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()), 'await_tele_files': ('📎 <b>Надішліть файли</b> (можна кілька)\n\nПісля <i>кожного</i> файла я відповім:\n«✅ Файл збережено».\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', files_aux_kb()), 'await_links': ('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nНадсилайте по одному в повідомленні — я відповім:\n«✅ Посилання збережено».\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', files_aux_kb()), 'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()), 'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення?', notes_yesno_kb()), 'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', done_kb())}
+                reprompt_map = {'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()), 'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()), 'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()), 'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()), 'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))), 'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()), 'await_tele_files': ('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', files_aux_kb()), 'await_links': ('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nНадсилайте по одному в повідомленні — я відповім:\n«✅ Посилання збережено».\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', files_aux_kb()), 'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()), 'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення?', notes_yesno_kb()), 'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', done_kb())}
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
                 resp = await msg.answer(hint, reply_markup=kb, parse_mode='HTML')
             st = state_by_chat.get(msg.chat.id)
@@ -1082,15 +1308,20 @@ async def flow(msg: Message):
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         if st:
             st.step = 'choose_files_method'
+            await save_bot_state_async(msg.chat.id, st)
         return
     if not st:
         state_by_chat[msg.chat.id] = OrderState()
         return await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
+    if msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO) and st.file_tail_open and st.step != 'await_tele_files':
+        await handle_telegram_upload(msg, st, silent=True, is_tail=True)
+        return
     if st and st.step == 'await_notes_choice':
         choice = (msg.text or '').strip()
         if choice == 'Так':
             await msg.answer('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля <i>кожного</i> я підтверджу:\n«✅ Повідомлення збережено».\n\nКоли надішлете <b>ВСІ</b> потрібні повідомлення —\nнатисніть «✅ Готово».', reply_markup=done_kb(), parse_mode='HTML')
             st.step = 'await_notes'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if choice == 'Ні':
             await finalize_order(msg, st)
@@ -1135,16 +1366,8 @@ async def flow(msg: Message):
                 label = f"{kind} №{w.get('Number')}: {(w.get('ShortAddress') or w.get('Description'))[:64]}"
                 rows.append([InlineKeyboardButton(text=label, callback_data=f"np_wh_pick:{w.get('Ref', '')}")])
             rows.append([InlineKeyboardButton(text='↩️ Ввести інший номер', callback_data='np_wh_back')])
-            resp = resp = await msg.answer('Знайшлось кілька варіантів. Оберіть потрібний:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            resp = await msg.answer('Знайшлось кілька варіантів. Оберіть потрібний:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
             st = state_by_chat.get(msg.chat.id)
-            if st:
-                st.last_inline_msg_id = resp.message_id
-            st = state_by_chat.get(msg.chat.id)
-            None
-            if st:
-                st.last_inline_msg_id = resp.message_id
-            st = state_by_chat.get(msg.chat.id)
-            None
             if st:
                 st.last_inline_msg_id = resp.message_id
             st.step = 'await_np_pick'
@@ -1158,6 +1381,7 @@ async def flow(msg: Message):
         await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         st.step = 'choose_files_method'
+        await save_bot_state_async(msg.chat.id, st)
         return
     if st.delivery_step:
         txt = (msg.text or '').strip()
@@ -1168,6 +1392,7 @@ async def flow(msg: Message):
             if not await _safe_set_cell(st.sheet_row, 'recipient_name', txt, msg): return
             await msg.answer('Введіть телефон отримувача (380XXXXXXXXX):', reply_markup=bottom_nav_kb())
             st.delivery_step = 'recv_phone'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if st.delivery_step == 'recv_phone':
             ph_digits = re.sub('\\D+', '', txt)
@@ -1177,6 +1402,7 @@ async def flow(msg: Message):
             if not await _safe_set_cell(st.sheet_row, 'recipient_phone', ph_digits, msg): return
             await msg.answer('Вкажіть місто (наприклад: Київ):', reply_markup=bottom_nav_kb())
             st.delivery_step = 'city_text'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if st.delivery_step == 'city_text':
             if not await _safe_set_cell(st.sheet_row, 'np_city_name', txt, msg): return
@@ -1199,6 +1425,7 @@ async def flow(msg: Message):
                 if not await _safe_set_cell(st.sheet_row, 'np_city_ref', st.np_city_ref, msg): return
                 st.delivery_step = ''
                 st.step = 'await_np_number'
+                await save_bot_state_async(msg.chat.id, st)
                 await msg.answer('Введіть номер відділення або поштомату (наприклад: 15 або 2345).', reply_markup=bottom_nav_kb())
                 return
             st.last_np_cities = matches[:20]
@@ -1215,14 +1442,6 @@ async def flow(msg: Message):
             st = state_by_chat.get(msg.chat.id)
             if st:
                 st.current_step = 'np_city_pick'
-            st = state_by_chat.get(msg.chat.id)
-            None
-            if st:
-                st.last_inline_msg_id = resp.message_id
-            st = state_by_chat.get(msg.chat.id)
-            None
-            if st:
-                st.last_inline_msg_id = resp.message_id
             return
         return
     if st.step == 'doctor_phone':
@@ -1238,6 +1457,7 @@ async def flow(msg: Message):
             pass
         await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
         st.step = 'patient_lastname'
+        await save_bot_state_async(msg.chat.id, st)
         return
     if st.step == 'patient_lastname':
         val = (msg.text or '').strip()
@@ -1248,6 +1468,7 @@ async def flow(msg: Message):
         if not await _safe_set_cell(st.sheet_row, 'patient_lastname', st.patient_lastname, msg): return
         await msg.answer('Який апарат замовляєте (сплінт, елайнери тощо):', reply_markup=bottom_nav_kb())
         st.step = 'work_type'
+        await save_bot_state_async(msg.chat.id, st)
         return
     if st.step == 'work_type':
         val = (msg.text or '').strip()
@@ -1258,6 +1479,7 @@ async def flow(msg: Message):
         if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
         await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
+        await save_bot_state_async(msg.chat.id, st)
         return
     if st and st.step == 'due_date':
         d = parse_date_uk(msg.text or '')
@@ -1285,6 +1507,7 @@ async def flow(msg: Message):
             reply_markup=np_menu_kb(has_saved=bool(profiles))
         )
         st.step = 'np_menu'
+        await save_bot_state_async(msg.chat.id, st)
         return
     if st and st.step == 'np_menu':
         t = (msg.text or '').strip()
@@ -1336,7 +1559,7 @@ async def flow(msg: Message):
                     short_name = full_name
                 text_btn = f"{short_name} • {pr.get('np_city_name', '')} • {pr.get('np_warehouse_desc', '')}"[:64]
                 rows.append([InlineKeyboardButton(text=text_btn, callback_data=f"np_pick:{pr.get('_row', '0')}")])
-            resp = resp = await msg.answer('Оберіть збережену адресу:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            resp = await msg.answer('Оберіть збережену адресу:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
             st = state_by_chat.get(msg.chat.id)
             if st:
                 st.last_inline_msg_id = resp.message_id
@@ -1360,18 +1583,25 @@ async def flow(msg: Message):
             await _clear_inline_markup(msg)
             await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             st.step = 'choose_files_method'
+            await save_bot_state_async(msg.chat.id, st)
             return
     if st.step == 'choose_files_method':
         t = msg.text or ''
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
-            await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nПісля <i>кожного</i> файла я відповім:\n«✅ Файл збережено».\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
+            st.files_done_pressed = False
+            st.file_tail_open = False
+            st.last_file_update_ts = 0.0
+            st.files_batch_ack_version = 0
+            await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
             await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nНадсилайте по одному в повідомленні — я відповім:\n«✅ Посилання збережено».\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_links'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if 'e-mail' in t.lower() or 'email' in t.lower():
             append_files_method(st.sheet_row, 'email')
@@ -1382,6 +1612,7 @@ async def flow(msg: Message):
             text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
             await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
+            await save_bot_state_async(msg.chat.id, st)
             return
         if 'Відбитки' in t:
             append_files_method(st.sheet_row, 'Imprint')
@@ -1414,6 +1645,10 @@ async def flow(msg: Message):
                 await msg.answer('Поки що файлів не додано. Надішліть хоча б один або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
+            st.files_done_pressed = True
+            st.file_tail_open = True
+            st.last_file_update_ts = time.time()
+            await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
             return
     if st.step == 'email_wait_done':
@@ -1424,27 +1659,7 @@ async def flow(msg: Message):
             await ask_notes(msg, st)
             return
     if st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO):
-        if not FILES_CHANNEL_ID:
-            await msg.answer('⚠️ FILES_CHANNEL_ID не налаштований у .env')
-            return
-        caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
-        try:
-            if msg.content_type == ContentType.DOCUMENT:
-                if msg.document.file_size and msg.document.file_size > 2 * 1024 * 1024 * 1024:
-                    await msg.answer('❌ Файл більший за 2 ГБ. Оберіть інший спосіб.')
-                    return
-                file_id = msg.document.file_id
-                await bot.send_document(FILES_CHANNEL_ID, file_id, caption=caption)
-            else:
-                file_id = msg.photo[-1].file_id
-                await bot.send_photo(FILES_CHANNEL_ID, file_id, caption=caption)
-            prev = get_cell(st.sheet_row, 'files_telegram_id')
-            set_cell(st.sheet_row, 'files_telegram_id', (prev + ' ' if prev else '') + file_id)
-            set_cell(st.sheet_row, 'status', 'files_received')
-            await msg.answer('✅ Ваші файли отримані і збережені', reply_markup=files_aux_kb())
-        except Exception as e:
-            logger.exception('Send to channel failed')
-            await msg.answer("Не можу зберегти файл. Тимчасові складності зі зв'язком. Спробуйте пізніше.", reply_markup=files_aux_kb())
+        await handle_telegram_upload(msg, st, silent=False, is_tail=False)
         return
     if st.step == 'await_notes':
         if (msg.text or '').strip() == '✅ Готово':
@@ -1572,6 +1787,7 @@ async def np_use_saved_cb(q: CallbackQuery):
         await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         st.delivery_step = ''
         st.step = 'choose_files_method'
+        await save_bot_state_async(msg.chat.id, st)
         return await q.answer()
     rows = []
     for pr in profiles[:20]:
