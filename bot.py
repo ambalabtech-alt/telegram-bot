@@ -716,19 +716,42 @@ def _batch_ack_markup_for_step(step: str):
 
 
 async def _send_batch_ack_later(chat_id: int, order_id: str, step: str, version: int) -> None:
+    """
+    Делай невелику паузу і показуй клавіатуру після прийому файлів/посилань/нотаток.
+
+    Якщо під час очікування користувач перейшов у інший крок або вже завершив відправку,
+    не відправляємо повідомлення. Інакше намагаємося примусово прибрати стару
+    клавіатуру та додати нову з кнопкою «✅ Готово», щоб вона гарантовано
+    з'явилася в клієнті.
+    """
     await asyncio.sleep(FILES_BATCH_ACK_DELAY_SEC)
     st = state_by_chat.get(chat_id)
+    # Перевіряємо, що стан ще актуальний для цього ack
     if not st:
         return
     if getattr(st, 'order_id', '') != order_id:
         return
     if getattr(st, 'step', '') != step:
         return
+    # Версія ack могла змінитись у випадку інших подій (наприклад, натискання "Готово")
     if int(getattr(st, 'batch_ack_version', 0) or 0) != version:
         return
+    # Підбираємо відповідну клавіатуру для кроку (файли, посилання або нотатки)
     markup = _batch_ack_markup_for_step(step)
     if markup is None:
         return
+    # Спершу намагаємось прибрати попередню клавіатуру, щоб нова гарантовано відобразилась
+    try:
+        from aiogram.types import ReplyKeyboardRemove  # локальний імпорт, щоб уникнути циклів
+        await bot.send_message(chat_id, '‎', reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+    # Невелика пауза, щоб Telegram встиг відобразити видалення
+    try:
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+    # Тепер відправляємо повідомлення з потрібною клавіатурою
     try:
         await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=markup)
     except Exception:
