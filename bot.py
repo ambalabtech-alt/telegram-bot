@@ -710,8 +710,6 @@ async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
 
 async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = False, is_tail: bool = False) -> bool:
     if not FILES_CHANNEL_ID:
-        if not silent and not is_tail:
-            await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=files_aux_kb())
         return False
 
     if msg.content_type == ContentType.DOCUMENT:
@@ -760,8 +758,6 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
 
     asyncio.create_task(_post_file_best_effort())
 
-    if not silent and not is_tail:
-        await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=files_aux_kb())
     return True
 
 async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
@@ -792,13 +788,13 @@ def files_method_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📁 Завантажити у бот (до 2Гб)')], [KeyboardButton(text='🔗 Надати посилання')], [KeyboardButton(text='✉️ Надіслати на e-mail')], [KeyboardButton(text='Відбитки')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def done_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False)
 
 def bottom_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def files_aux_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False)
 NP_MENU_ADD = '✏️ Додати нову адресу'
 NP_MENU_USE_SAVED = '📦 На збережену адресу'
 NP_MENU_SKIP = '⏭️ Пропустити'
