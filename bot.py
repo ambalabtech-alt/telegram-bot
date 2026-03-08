@@ -710,6 +710,8 @@ async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
 
 async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = False, is_tail: bool = False) -> bool:
     if not FILES_CHANNEL_ID:
+        if not silent and not is_tail:
+            await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=files_aux_kb())
         return False
 
     if msg.content_type == ContentType.DOCUMENT:
@@ -794,7 +796,7 @@ def bottom_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def files_aux_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 NP_MENU_ADD = '✏️ Додати нову адресу'
 NP_MENU_USE_SAVED = '📦 На збережену адресу'
 NP_MENU_SKIP = '⏭️ Пропустити'
@@ -1156,7 +1158,6 @@ async def contact_tech(msg: Message):
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
-    await msg.answer("⏳ Перевіряю профіль лікаря. Зачекайте, будь ласка.")
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
     st = OrderState()
@@ -1737,7 +1738,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=done_kb())
+            await msg.answer('Можете надсилати ще або натисніть «✅ Готово».', reply_markup=done_kb())
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -1749,7 +1750,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=done_kb())
+            await msg.answer('Можете надсилати ще або натисніть «✅ Готово».', reply_markup=done_kb())
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
