@@ -429,11 +429,9 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         elif 'email' in files_method and not rv('email_sent'):
             st.step = 'email_wait_done'
         elif not (notes.strip() or voice.strip()):
-            # No notes or voice yet – prompt the doctor whether they want to add any
             st.step = 'await_notes_choice'
         else:
-            # Notes or voice messages already exist – stay in await_notes so the doctor can add more or press Done
-            st.step = 'await_notes'
+            st.step = 'await_notes_choice'
         return st
     except Exception:
         logger.exception('Order restore from sheet failed')
@@ -684,6 +682,7 @@ class OrderState:
     last_file_update_ts: float = 0.0
     file_tail_timeout_sec: int = FILE_TAIL_TIMEOUT_SEC
     files_batch_ack_version: int = 0
+    batch_ack_version: int = 0
     accepted_files_count: int = 0
     accepted_links_count: int = 0
     accepted_notes_count: int = 0
@@ -704,8 +703,52 @@ def append_telegram_file_id_unique(row: int, file_id: str) -> str:
         set_cell(row, 'files_telegram_id', ' '.join(parts))
     return ' '.join(parts)
 
+def _invalidate_batch_ack(st: 'OrderState') -> None:
+    st.batch_ack_version = int(getattr(st, 'batch_ack_version', 0) or 0) + 1
+
+
+def _batch_ack_markup_for_step(step: str):
+    if step in ('await_tele_files', 'await_links'):
+        return files_aux_kb()
+    if step == 'await_notes':
+        return done_kb()
+    return None
+
+
+async def _send_batch_ack_later(chat_id: int, order_id: str, step: str, version: int) -> None:
+    await asyncio.sleep(FILES_BATCH_ACK_DELAY_SEC)
+    st = state_by_chat.get(chat_id)
+    if not st:
+        return
+    if getattr(st, 'order_id', '') != order_id:
+        return
+    if getattr(st, 'step', '') != step:
+        return
+    if int(getattr(st, 'batch_ack_version', 0) or 0) != version:
+        return
+    markup = _batch_ack_markup_for_step(step)
+    if markup is None:
+        return
+    try:
+        await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=markup)
+    except Exception:
+        logger.exception('Batch ack send failed for step=%s chat_id=%s', step, chat_id)
+
+
 async def schedule_files_batch_ack(msg: Message, order_id: str, ack_version: int) -> None:
-    return
+    await _send_batch_ack_later(msg.chat.id, order_id, 'await_tele_files', ack_version)
+
+
+def _queue_batch_ack(msg: Message, st: 'OrderState', step: Optional[str] = None) -> None:
+    step_name = step or getattr(st, 'step', '')
+    if step_name not in ('await_tele_files', 'await_links', 'await_notes'):
+        return
+    st.batch_ack_version = int(getattr(st, 'batch_ack_version', 0) or 0) + 1
+    version = st.batch_ack_version
+    if step_name == 'await_tele_files':
+        asyncio.create_task(schedule_files_batch_ack(msg, st.order_id, version))
+    else:
+        asyncio.create_task(_send_batch_ack_later(msg.chat.id, st.order_id, step_name, version))
 
 async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
     return await asyncio.to_thread(append_telegram_file_id_unique, row, file_id)
@@ -761,6 +804,8 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
             logger.exception('post file save best-effort failed')
 
     asyncio.create_task(_post_file_best_effort())
+    if not silent and getattr(st, 'step', '') == 'await_tele_files':
+        _queue_batch_ack(msg, st, 'await_tele_files')
 
     return True
 
@@ -798,7 +843,7 @@ def bottom_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def files_aux_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
 
 async def _refresh_done_keyboard(msg: Message, text: str = 'Можете надсилати ще або натисніть «✅ Готово».') -> None:
     """Force Telegram clients to reopen reply keyboard for note steps."""
@@ -1203,6 +1248,7 @@ async def ask_notes(msg: Message, st: OrderState):
 async def finalize_order(msg: Message, st: OrderState):
     if getattr(st, 'finalized', False):
         return
+    _invalidate_batch_ack(st)
     st.finalized = True
     try:
         if getattr(st, 'sheet_row', 0):
@@ -1679,6 +1725,7 @@ async def flow(msg: Message):
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
+            _invalidate_batch_ack(st)
             await ask_notes(msg, st)
             return
         urls = extract_urls(msg.text or '')
@@ -1699,7 +1746,7 @@ async def flow(msg: Message):
             except Exception:
                 logger.exception('links best-effort save failed')
         asyncio.create_task(_save_links_best_effort(new_urls))
-        await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=files_aux_kb())
+        _queue_batch_ack(msg, st, 'await_links')
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
@@ -1710,6 +1757,7 @@ async def flow(msg: Message):
             st.files_done_pressed = True
             st.file_tail_open = True
             st.last_file_update_ts = time.time()
+            _invalidate_batch_ack(st)
             await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
             return
@@ -1718,6 +1766,7 @@ async def flow(msg: Message):
             set_cell(st.sheet_row, 'status', 'files_expected')
             set_cell(st.sheet_row, 'email_sent', 'Yes')
             set_cell(st.sheet_row, 'status', 'files_expected')
+            _invalidate_batch_ack(st)
             await ask_notes(msg, st)
             return
     if st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO):
@@ -1725,6 +1774,7 @@ async def flow(msg: Message):
         return
     if st.step == 'await_notes':
         if (msg.text or '').strip() == '✅ Готово':
+            _invalidate_batch_ack(st)
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
@@ -1752,7 +1802,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            await _refresh_done_keyboard(msg)
+            _queue_batch_ack(msg, st, 'await_notes')
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -1764,7 +1814,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            await _refresh_done_keyboard(msg)
+            _queue_batch_ack(msg, st, 'await_notes')
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
