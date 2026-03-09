@@ -1436,7 +1436,6 @@ async def flow(msg: Message):
             await msg.answer('Спочатку оберіть місто доставки.')
             return
         await msg.answer('🔎 Шукаю відділення/поштомат за номером…')
-        import asyncio
         try:
             whs = await asyncio.wait_for(np_search_warehouses(st.np_city_ref, str(num)), timeout=10)
         except asyncio.TimeoutError:
@@ -2108,7 +2107,6 @@ def _parse_created_at(s: str):
         return None
 
 # === Retry helpers for Google Sheets (503/429) ===
-import asyncio
 import gspread
 
 async def _get_all_values_with_retry(ws, retries: int = 5, base_delay: int = 5, max_delay: int = 60):
@@ -2250,7 +2248,6 @@ async def main():
 
 # --- Cloud Run entrypoint: HTTP server + aiogram polling ---
 import os
-import asyncio
 from aiohttp import web
 
 async def _health(request):
