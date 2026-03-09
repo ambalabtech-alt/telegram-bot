@@ -1502,7 +1502,6 @@ async def flow(msg: Message):
             return
         if st.delivery_step == 'city_text':
             if not await _safe_set_cell(st.sheet_row, 'np_city_name', txt, msg): return
-            import asyncio
             try:
                 matches = await asyncio.wait_for(np_search_cities(txt), timeout=10)
             except asyncio.TimeoutError:
