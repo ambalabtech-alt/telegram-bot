@@ -842,17 +842,30 @@ def touch_files_wave(st: 'OrderState', msg: Message) -> None:
     """Updates the file wave state with a new file event.
 
     Increments the count if this file has not been seen in the current wave and
-    updates the timestamp of the last file.  If the message is part of a
-    Telegram media group (album), we track that separately to avoid
-    prematurely ending the wave while the album is still being delivered.
+    updates the timestamp of the last file. If the previous wave has already
+    produced an acknowledgement and enough silence has passed, this function
+    automatically opens a NEW wave so the next burst of files also gets exactly
+    one acknowledgement.
     """
     now_ts = time.time()
+
+    # Reopen wave after a completed ack if a new burst starts later.
+    if st.files_wave_ack_sent and (now_ts - st.files_wave_last_ts) > FILES_WAVE_SILENCE_SEC:
+        st.files_wave_id += 1
+        st.files_wave_count = 0
+        st.files_wave_ack_sent = False
+        st.files_seen_keys.clear()
+        st.files_active_media_group_id = ''
+        st.files_active_media_group_last_ts = 0.0
+        st.files_wave_task = None
+
     key = build_file_event_key(msg)
     if key not in st.files_seen_keys:
         st.files_seen_keys.add(key)
         st.files_wave_count += 1
     st.files_wave_last_ts = now_ts
-    # track active media group to handle Telegram albums
+
+    # Track active media group to handle Telegram albums.
     media_group_id = ''
     try:
         media_group_id = str(getattr(msg, 'media_group_id', '') or '')
@@ -867,13 +880,23 @@ def touch_links_wave(st: 'OrderState', new_count: int) -> None:
     """Updates the link wave state.
 
     Increments the count by the number of new links and updates the timestamp
-    of the last link.  This should be called whenever a message containing
-    external URLs is processed.
+    of the last link. If the previous link wave has already produced an
+    acknowledgement and enough silence has passed, a new wave is opened first.
     """
     if new_count <= 0:
         return
+
+    now_ts = time.time()
+
+    # Reopen wave after a completed ack if a new burst starts later.
+    if st.links_wave_ack_sent and (now_ts - st.links_wave_last_ts) > LINKS_WAVE_SILENCE_SEC:
+        st.links_wave_id += 1
+        st.links_wave_count = 0
+        st.links_wave_ack_sent = False
+        st.links_wave_task = None
+
     st.links_wave_count += new_count
-    st.links_wave_last_ts = time.time()
+    st.links_wave_last_ts = now_ts
 
 
 def ensure_files_wave_task(msg: Message, st: 'OrderState') -> None:
