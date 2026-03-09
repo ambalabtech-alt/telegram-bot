@@ -14,7 +14,7 @@ KYIV_TZ = ZoneInfo('Europe/Kyiv')
 
 def now_kyiv() -> datetime:
     return datetime.now(KYIV_TZ)
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import quote
 from dotenv import load_dotenv
 from google.cloud import storage
@@ -193,6 +193,22 @@ PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/v
 FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
 FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '3'))
 BOT_STATE_SHEET_NAME = os.getenv('BOT_STATE_SHEET_NAME', '_bot_state')
+
+# -----------------------------------------------------------------------------
+# Wave upload configuration
+#
+# The bot groups incoming files and links into "waves" (batches).  A wave is
+# considered complete when there has been no new content for a given period of
+# time.  The period is configurable via the following constants.  When a wave
+# ends the bot sends a single “you can send more or press done” message.  This
+# avoids spamming the user with acknowledgements on every file/link and makes
+# the upload process smoother.
+#
+# Increase these values if your users tend to send files slowly (for example if
+# they are large) or if you notice the bot splitting a single batch into
+# multiple waves.  Decrease them if you need faster feedback.
+FILES_WAVE_SILENCE_SEC = float(os.getenv('FILES_WAVE_SILENCE_SEC', '3.0'))
+LINKS_WAVE_SILENCE_SEC = float(os.getenv('LINKS_WAVE_SILENCE_SEC', '3.0'))
 
 
 def get_creds():
@@ -679,6 +695,34 @@ class OrderState:
     np_warehouse_ref: str = ''
     offtopic_tries: int = 0
     seen_boot_ts: int = 0
+    # The following group of fields implement the state machine for file and
+    # link upload “waves”.  A wave groups together multiple files or links
+    # arriving within a short period and ensures the bot sends only one
+    # acknowledgement per wave.  See `FILES_WAVE_SILENCE_SEC` and
+    # `LINKS_WAVE_SILENCE_SEC` for configuration.
+    files_wave_id: int = 0
+    files_wave_count: int = 0
+    files_wave_last_ts: float = 0.0
+    files_wave_ack_sent: bool = False
+    files_wave_closed: bool = False
+    files_wave_task: Optional[asyncio.Task] = None
+    files_done_cutoff_ts: float = 0.0
+    files_seen_keys: Set[str] = field(default_factory=set)
+    files_active_media_group_id: str = ''
+    files_active_media_group_last_ts: float = 0.0
+
+    links_wave_id: int = 0
+    links_wave_count: int = 0
+    links_wave_last_ts: float = 0.0
+    links_wave_ack_sent: bool = False
+    links_wave_closed: bool = False
+    links_wave_task: Optional[asyncio.Task] = None
+    links_done_cutoff_ts: float = 0.0
+
+    # Legacy fields retained for compatibility with other parts of the bot.
+    # They are no longer used by the file/link upload logic but remain to
+    # avoid AttributeErrors if referenced elsewhere.  Consider removing
+    # these completely once the old logic has been purged from the codebase.
     files_done_pressed: bool = False
     file_tail_open: bool = False
     last_file_update_ts: float = 0.0
@@ -691,6 +735,249 @@ class OrderState:
     pending_links: List[str] = field(default_factory=list)
     finalized: bool = False
 state_by_chat: Dict[int, OrderState] = {}
+
+# =============================================================================
+# Wave handling helpers
+#
+# These functions implement the logic for grouping incoming files and links into
+# waves. A wave collects all items that arrive within a short period of
+# silence, measured by FILES_WAVE_SILENCE_SEC and LINKS_WAVE_SILENCE_SEC.
+# Exactly one acknowledgement message is sent at the end of each wave.  When
+# the user presses “✅ Готово”, the current wave is forcibly closed and no
+# further acknowledgements are sent for that step.
+
+def reset_files_wave(st: 'OrderState') -> None:
+    """Resets the file wave state on the given order state.
+
+    Cancels any existing watcher task and clears counters, preparing to
+    accumulate a new wave of file uploads.  This should be called when
+    entering the file upload step.
+    """
+    st.files_wave_id += 1
+    st.files_wave_count = 0
+    st.files_wave_last_ts = 0.0
+    st.files_wave_ack_sent = False
+    st.files_wave_closed = False
+    st.files_done_cutoff_ts = 0.0
+    st.files_seen_keys.clear()
+    st.files_active_media_group_id = ''
+    st.files_active_media_group_last_ts = 0.0
+    # cancel old watcher
+    task = getattr(st, 'files_wave_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.files_wave_task = None
+
+
+def reset_links_wave(st: 'OrderState') -> None:
+    """Resets the link wave state on the given order state.
+
+    Similar to reset_files_wave but for external link uploads.
+    """
+    st.links_wave_id += 1
+    st.links_wave_count = 0
+    st.links_wave_last_ts = 0.0
+    st.links_wave_ack_sent = False
+    st.links_wave_closed = False
+    st.links_done_cutoff_ts = 0.0
+    # cancel old watcher
+    task = getattr(st, 'links_wave_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.links_wave_task = None
+
+
+def close_files_wave(st: 'OrderState') -> None:
+    """Forcibly closes the current file wave.
+
+    After calling this no further acknowledgement messages will be scheduled
+    for the current file upload step, and subsequent files will be ignored
+    for the purpose of acknowledgement.  Background tasks for already
+    accepted files will continue to run.
+    """
+    st.files_wave_closed = True
+    st.files_done_cutoff_ts = time.time()
+    task = getattr(st, 'files_wave_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.files_wave_task = None
+
+
+def close_links_wave(st: 'OrderState') -> None:
+    """Forcibly closes the current link wave.
+
+    Similar to close_files_wave but for external links.
+    """
+    st.links_wave_closed = True
+    st.links_done_cutoff_ts = time.time()
+    task = getattr(st, 'links_wave_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.links_wave_task = None
+
+
+def build_file_event_key(msg: Message) -> str:
+    """Builds a deduplication key for a file or photo event.
+
+    This prevents counting the same file more than once in a wave.
+    """
+    if msg.content_type == ContentType.DOCUMENT:
+        return f"doc:{msg.document.file_id}"
+    return f"photo:{msg.photo[-1].file_id}"
+
+
+def touch_files_wave(st: 'OrderState', msg: Message) -> None:
+    """Updates the file wave state with a new file event.
+
+    Increments the count if this file has not been seen in the current wave and
+    updates the timestamp of the last file.  If the message is part of a
+    Telegram media group (album), we track that separately to avoid
+    prematurely ending the wave while the album is still being delivered.
+    """
+    now_ts = time.time()
+    key = build_file_event_key(msg)
+    if key not in st.files_seen_keys:
+        st.files_seen_keys.add(key)
+        st.files_wave_count += 1
+    st.files_wave_last_ts = now_ts
+    # track active media group to handle Telegram albums
+    media_group_id = ''
+    try:
+        media_group_id = str(getattr(msg, 'media_group_id', '') or '')
+    except Exception:
+        media_group_id = ''
+    if media_group_id:
+        st.files_active_media_group_id = media_group_id
+        st.files_active_media_group_last_ts = now_ts
+
+
+def touch_links_wave(st: 'OrderState', new_count: int) -> None:
+    """Updates the link wave state.
+
+    Increments the count by the number of new links and updates the timestamp
+    of the last link.  This should be called whenever a message containing
+    external URLs is processed.
+    """
+    if new_count <= 0:
+        return
+    st.links_wave_count += new_count
+    st.links_wave_last_ts = time.time()
+
+
+def ensure_files_wave_task(msg: Message, st: 'OrderState') -> None:
+    """Ensures that a watcher task is running for the current file wave.
+
+    If a watcher is already active nothing is done.  Otherwise a new
+    asynchronous task is created that will wait for a period of silence and
+    then send a single acknowledgement message to the user.  The task is
+    cancelled automatically when the wave is closed or the step changes.
+    """
+    if st.files_wave_closed:
+        return
+    task = getattr(st, 'files_wave_task', None)
+    if task is None or task.done():
+        wave_id = st.files_wave_id
+        st.files_wave_task = asyncio.create_task(
+            watch_files_wave(msg.chat.id, st.order_id, wave_id)
+        )
+
+
+def ensure_links_wave_task(msg: Message, st: 'OrderState') -> None:
+    """Ensures that a watcher task is running for the current link wave.
+
+    Similar to ensure_files_wave_task but for links.
+    """
+    if st.links_wave_closed:
+        return
+    task = getattr(st, 'links_wave_task', None)
+    if task is None or task.done():
+        wave_id = st.links_wave_id
+        st.links_wave_task = asyncio.create_task(
+            watch_links_wave(msg.chat.id, st.order_id, wave_id)
+        )
+
+
+async def watch_files_wave(chat_id: int, order_id: str, wave_id: int) -> None:
+    """Watches for the end of a file upload wave.
+
+    This coroutine periodically checks whether the current wave has ended.  A
+    wave ends when there has been no new file for FILES_WAVE_SILENCE_SEC and
+    there is no active media group being received.  Once ended, the bot
+    sends exactly one acknowledgement message and marks the wave as
+    acknowledged.
+    """
+    while True:
+        await asyncio.sleep(0.35)
+        st = state_by_chat.get(chat_id)
+        if not st:
+            return
+        # if order changed or new wave started, exit
+        if st.order_id != order_id or st.files_wave_id != wave_id:
+            return
+        # closed wave or ack already sent -> exit
+        if st.files_wave_closed or st.files_wave_ack_sent:
+            return
+        # if step changed away from file upload -> exit
+        if st.step != 'await_tele_files':
+            return
+        # if still receiving a Telegram album, wait a bit longer
+        if st.files_active_media_group_id:
+            if (time.time() - st.files_active_media_group_last_ts) < 1.0:
+                continue
+            st.files_active_media_group_id = ''
+            st.files_active_media_group_last_ts = 0.0
+        # if not enough silence yet, continue
+        silence = time.time() - st.files_wave_last_ts
+        if silence < FILES_WAVE_SILENCE_SEC:
+            continue
+        # send ack
+        try:
+            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
+            st.files_wave_ack_sent = True
+        except Exception:
+            logger.exception('files wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
+        return
+
+
+async def watch_links_wave(chat_id: int, order_id: str, wave_id: int) -> None:
+    """Watches for the end of a link upload wave.
+
+    Similar to watch_files_wave but for external link uploads.  When the
+    silence period has elapsed and no ack has been sent, the bot sends a
+    single acknowledgement message.
+    """
+    while True:
+        await asyncio.sleep(0.35)
+        st = state_by_chat.get(chat_id)
+        if not st:
+            return
+        if st.order_id != order_id or st.links_wave_id != wave_id:
+            return
+        if st.links_wave_closed or st.links_wave_ack_sent:
+            return
+        if st.step != 'await_links':
+            return
+        silence = time.time() - st.links_wave_last_ts
+        if silence < LINKS_WAVE_SILENCE_SEC:
+            continue
+        try:
+            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
+            st.links_wave_ack_sent = True
+        except Exception:
+            logger.exception('links wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
+        return
 
 def refresh_file_tail_state(st: 'OrderState') -> None:
     if getattr(st, 'file_tail_open', False) and getattr(st, 'last_file_update_ts', 0.0):
@@ -756,32 +1043,44 @@ async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
     return await asyncio.to_thread(append_telegram_file_id_unique, row, file_id)
 
 async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = False, is_tail: bool = False) -> bool:
-    if not FILES_CHANNEL_ID:
-        if not silent and not is_tail:
-            await msg.answer('Можна надсилати ще або натисніть «✅ Готово».', reply_markup=files_aux_kb())
-        return False
+    """
+    Handles an incoming Telegram file or photo during the file upload step.
 
+    Files are grouped into waves (see wave helpers above).  When a file is
+    received it is recorded in the order state, uploaded to the channel and
+    Sheets in a background task, and the wave is updated.  A watcher task
+    monitors the wave and sends exactly one acknowledgement message once the
+    wave has ended.  If the wave has been closed (user pressed ✅ Готово) no
+    further files are accepted for acknowledgement, though they are still
+    saved silently.
+    """
+    # Do not process if channel is not configured
+    if not FILES_CHANNEL_ID:
+        return False
+    # Do not accept new files after the user pressed Done
+    if st.files_wave_closed:
+        return False
+    # Validate file size for documents
     if msg.content_type == ContentType.DOCUMENT:
         if msg.document.file_size and msg.document.file_size > 2 * 1024 * 1024 * 1024:
-            if not silent and not is_tail:
+            if not silent:
                 await msg.answer('❌ Файл більший за 2 ГБ. Оберіть інший спосіб.', reply_markup=files_aux_kb())
             return False
         file_id = msg.document.file_id
     else:
         file_id = msg.photo[-1].file_id
-
+    # Deduplicate within this upload session
     if file_id not in st.telegram_file_ids:
         st.telegram_file_ids.append(file_id)
         st.accepted_files_count += 1
-
-    st.last_file_update_ts = time.time()
-    if is_tail or getattr(st, 'files_done_pressed', False):
-        st.file_tail_open = True
-
+    # Update wave state and ensure watcher
+    touch_files_wave(st, msg)
+    ensure_files_wave_task(msg, st)
+    # Prepare caption for channel posting
     caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
-
-    async def _post_file_best_effort():
+    async def _post_file_best_effort(row_snapshot: int, order_id_snapshot: str):
         try:
+            # Upload file to channel with retries
             for attempt in range(3):
                 try:
                     if msg.content_type == ContentType.DOCUMENT:
@@ -793,10 +1092,15 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
                     logger.exception('Send to channel failed, attempt %s/3', attempt + 1)
                     if attempt < 2:
                         await asyncio.sleep(1 * (2 ** attempt))
+            # Write file_id to Sheets with retries
             for attempt in range(3):
                 try:
-                    await _append_telegram_file_id_unique_async(st.sheet_row, file_id)
-                    await asyncio.to_thread(set_cell, st.sheet_row, 'status', 'files_received')
+                    row = row_snapshot or getattr(st, 'sheet_row', 0)
+                    if not row:
+                        row = find_row_by_order_id(order_id_snapshot)
+                    if row:
+                        await _append_telegram_file_id_unique_async(row, file_id)
+                        await asyncio.to_thread(set_cell, row, 'status', 'files_received')
                     break
                 except Exception:
                     logger.exception('files_telegram_id write failed, attempt %s/3', attempt + 1)
@@ -804,11 +1108,10 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
                         await asyncio.sleep(1 * (2 ** attempt))
         except Exception:
             logger.exception('post file save best-effort failed')
-
-    asyncio.create_task(_post_file_best_effort())
-    if not silent and getattr(st, 'step', '') == 'await_tele_files':
-        _queue_batch_ack(msg, st, 'await_tele_files')
-
+    # Snapshots for background task
+    row_snapshot = getattr(st, 'sheet_row', 0)
+    order_id_snapshot = st.order_id
+    asyncio.create_task(_post_file_best_effort(row_snapshot, order_id_snapshot))
     return True
 
 async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
@@ -1269,8 +1572,10 @@ async def flow(msg: Message):
         st = await load_bot_state_async(msg.chat.id)
         if st:
             state_by_chat[msg.chat.id] = st
-    if st:
-        refresh_file_tail_state(st)
+    # We no longer use the file tail mechanism; file waves are managed
+    # separately.  Therefore, do not refresh tail state here.
+    # if st:
+    #     refresh_file_tail_state(st)
 
     # Додатковий захист: URL/посилання поза сценарієм — також у Головне меню
     if msg.content_type == 'text':
@@ -1295,8 +1600,11 @@ async def flow(msg: Message):
     if msg.content_type != 'text':
         expecting_file = st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
         expecting_voice = st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE
-        tail_file_allowed = st and st.file_tail_open and st.step != 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
-        if not (expecting_file or expecting_voice or tail_file_allowed):
+        # We no longer accept files outside of the file upload step. After the
+        # user presses Done, additional files are ignored and treated as
+        # off-topic.  Therefore we do not allow any file uploads when
+        # expecting_file is False.
+        if not (expecting_file or expecting_voice):
             if st is not None:
                 handled = await _warn_or_reset_to_menu(msg, st)
                 if handled:
@@ -1683,10 +1991,8 @@ async def flow(msg: Message):
         t = msg.text or ''
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
-            st.files_done_pressed = False
-            st.file_tail_open = False
-            st.last_file_update_ts = 0.0
-            st.files_batch_ack_version = 0
+            # Reset file wave state and counters
+            reset_files_wave(st)
             st.accepted_files_count = 0
             await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
@@ -1694,6 +2000,8 @@ async def flow(msg: Message):
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
+            # Reset link wave state and counters
+            reset_links_wave(st)
             st.accepted_links_count = 0
             st.pending_links = []
             await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
@@ -1721,43 +2029,56 @@ async def flow(msg: Message):
         return
     if st.step == 'await_links':
         if (msg.text or '').strip() == '✅ Готово':
+            # If no links were accepted, ask the user to provide at least one
             if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
+            # Close the current wave and update Sheets
+            close_links_wave(st)
             set_cell(st.sheet_row, 'status', 'files_expected')
-            _invalidate_batch_ack(st)
             await ask_notes(msg, st)
             return
         urls = extract_urls(msg.text or '')
+        # If no URLs are detected, prompt the user to send a valid link
         if not urls:
             await msg.answer('Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
             return
-        new_urls = []
+        # Collect new URLs (deduplicated within this session)
+        new_urls: List[str] = []
         for u in urls:
             if u not in st.pending_links:
                 st.pending_links.append(u)
                 st.accepted_links_count += 1
                 new_urls.append(u)
-        async def _save_links_best_effort(urls_to_save: List[str]):
+        # Update wave state and ensure watcher
+        if new_urls:
+            touch_links_wave(st, len(new_urls))
+            ensure_links_wave_task(msg, st)
+        # Save links to Sheets in the background
+        async def _save_links_best_effort(urls_to_save: List[str], row_snapshot: int, order_id_snapshot: str):
             try:
                 if urls_to_save:
-                    await asyncio.to_thread(update_joined, st.sheet_row, 'links_external', urls_to_save)
-                    await asyncio.to_thread(set_cell, st.sheet_row, 'status', 'files_received')
+                    row = row_snapshot or getattr(st, 'sheet_row', 0)
+                    if not row:
+                        row = find_row_by_order_id(order_id_snapshot)
+                    if row:
+                        await asyncio.to_thread(update_joined, row, 'links_external', urls_to_save)
+                        await asyncio.to_thread(set_cell, row, 'status', 'files_received')
             except Exception:
                 logger.exception('links best-effort save failed')
-        asyncio.create_task(_save_links_best_effort(new_urls))
-        _queue_batch_ack(msg, st, 'await_links')
+        row_snapshot = getattr(st, 'sheet_row', 0)
+        order_id_snapshot = st.order_id
+        asyncio.create_task(_save_links_best_effort(new_urls, row_snapshot, order_id_snapshot))
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
+            # Require at least one file before finishing
             if st.accepted_files_count <= 0 and not st.telegram_file_ids:
                 await msg.answer('Поки що файлів не додано. Надішліть хоча б один або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
+            # Close current file wave and move on
+            close_files_wave(st)
             set_cell(st.sheet_row, 'status', 'files_expected')
-            _invalidate_batch_ack(st)
-            st.files_done_pressed = True
-            st.file_tail_open = True
-            st.last_file_update_ts = time.time()
             await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
             return
