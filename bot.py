@@ -429,9 +429,11 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         elif 'email' in files_method and not rv('email_sent'):
             st.step = 'email_wait_done'
         elif not (notes.strip() or voice.strip()):
+            # No notes or voice yet – prompt the doctor whether they want to add any
             st.step = 'await_notes_choice'
         else:
-            st.step = 'await_notes_choice'
+            # Notes or voice messages already exist – stay in await_notes so the doctor can add more or press Done
+            st.step = 'await_notes'
         return st
     except Exception:
         logger.exception('Order restore from sheet failed')
@@ -730,11 +732,6 @@ async def _send_batch_ack_later(chat_id: int, order_id: str, step: str, version:
     if markup is None:
         return
     try:
-        try:
-            await bot.send_message(chat_id, '‎', reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
         await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=markup)
     except Exception:
         logger.exception('Batch ack send failed for step=%s chat_id=%s', step, chat_id)
@@ -839,28 +836,28 @@ def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🧾 Зробити замовлення'), KeyboardButton(text='📷 Instagram')], [KeyboardButton(text="☎️ Зв'язатися з техніком"), KeyboardButton(text='📂 Завантажити прайс')]], resize_keyboard=True)
 
 def files_method_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📁 Завантажити у бот (до 2Гб)')], [KeyboardButton(text='🔗 Надати посилання')], [KeyboardButton(text='✉️ Надіслати на e-mail')], [KeyboardButton(text='Відбитки')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📁 Завантажити у бот (до 2Гб)')], [KeyboardButton(text='🔗 Надати посилання')], [KeyboardButton(text='✉️ Надіслати на e-mail')], [KeyboardButton(text='Відбитки')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def done_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
 
 def bottom_nav_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def files_aux_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
-
-async def _refresh_reply_keyboard(msg: Message, reply_markup, text: str, parse_mode: Optional[str] = 'HTML') -> None:
-    """Надсилає повідомлення з reply-клавіатурою без її примусового приховування."""
-    kwargs = {'reply_markup': reply_markup}
-    if parse_mode:
-        kwargs['parse_mode'] = parse_mode
-    await msg.answer(text, **kwargs)
-
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 async def _refresh_done_keyboard(msg: Message, text: str = 'Можете надсилати ще або натисніть «✅ Готово».') -> None:
     """Force Telegram clients to reopen reply keyboard for note steps."""
-    await _refresh_reply_keyboard(msg, done_kb(), text, parse_mode='HTML')
+    try:
+        await msg.answer('‎', reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+    try:
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+    await msg.answer(text, reply_markup=done_kb(), parse_mode='HTML')
 NP_MENU_ADD = '✏️ Додати нову адресу'
 NP_MENU_USE_SAVED = '📦 На збережену адресу'
 NP_MENU_SKIP = '⏭️ Пропустити'
@@ -874,7 +871,7 @@ def np_menu_kb(has_saved: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def notes_yesno_kb():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Так'), KeyboardButton(text='Ні')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Так'), KeyboardButton(text='Ні')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=True)
 
 def confirm_cancel_kb(one_time: bool=True) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Так, скасувати і в меню'), KeyboardButton(text='Ні, продовжити')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=one_time)
@@ -1712,7 +1709,7 @@ async def flow(msg: Message):
             lastname = getattr(st, 'patient_lastname', '') or ''
             subject = f'AmbaLab order {nz(st.order_id)} - {lastname}' if lastname else f'AmbaLab order {nz(st.order_id)}'
             text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
-            await _refresh_reply_keyboard(msg, files_aux_kb(), text, parse_mode='HTML')
+            await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -1751,8 +1748,7 @@ async def flow(msg: Message):
             except Exception:
                 logger.exception('links best-effort save failed')
         asyncio.create_task(_save_links_best_effort(new_urls))
-        await _refresh_reply_keyboard(msg, files_aux_kb(), 'Можна докинути ще або натиснути «✅ Готово».', parse_mode=None)
-        _invalidate_batch_ack(st)
+        _queue_batch_ack(msg, st, 'await_links')
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
@@ -1760,10 +1756,10 @@ async def flow(msg: Message):
                 await msg.answer('Поки що файлів не додано. Надішліть хоча б один або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
+            _invalidate_batch_ack(st)
             st.files_done_pressed = True
             st.file_tail_open = True
             st.last_file_update_ts = time.time()
-            _invalidate_batch_ack(st)
             await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
             return
@@ -1808,8 +1804,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            await _refresh_reply_keyboard(msg, done_kb(), 'Можна докинути ще або натиснути «✅ Готово».', parse_mode=None)
-            _invalidate_batch_ack(st)
+            _queue_batch_ack(msg, st, 'await_notes')
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -1821,8 +1816,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            await _refresh_reply_keyboard(msg, done_kb(), 'Можна докинути ще або натиснути «✅ Готово».', parse_mode=None)
-            _invalidate_batch_ack(st)
+            _queue_batch_ack(msg, st, 'await_notes')
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
