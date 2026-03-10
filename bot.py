@@ -169,6 +169,238 @@ async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
         st._pending_updates.append((col_name, value))
 
     return True
+
+
+def _ensure_pending_updates(st: "OrderState") -> None:
+    if not hasattr(st, "_pending_updates"):
+        st._pending_updates = []
+    if not hasattr(st, "_sheet_write_lock"):
+        st._sheet_write_lock = asyncio.Lock()
+
+
+async def _resolve_sheet_row_for_state(st: "OrderState", row_snapshot: int = 0, order_id_snapshot: str = "", wait_seconds: float = 5.0) -> int:
+    row = row_snapshot or getattr(st, "sheet_row", 0) or 0
+    if row:
+        return row
+
+    deadline = time.time() + max(wait_seconds, 0.0)
+    while time.time() < deadline:
+        row = getattr(st, "sheet_row", 0) or 0
+        if row:
+            return row
+        await asyncio.sleep(0.5)
+
+    lookup_order_id = (order_id_snapshot or getattr(st, "order_id", "") or "").strip()
+    if lookup_order_id:
+        for attempt in range(3):
+            try:
+                row = await asyncio.to_thread(find_row_by_order_id, lookup_order_id)
+                if row:
+                    st.sheet_row = row
+                    return row
+            except Exception:
+                logger.exception("Sheets: resolve row by order_id failed, attempt %s/3", attempt + 1)
+            if attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+    return 0
+
+
+async def _apply_pending_update_for_state(row: int, pending_col: str, pending_value) -> bool:
+    try:
+        if pending_col == "files_telegram_id_append_unique":
+            await asyncio.to_thread(append_telegram_file_id_unique, row, pending_value)
+            return True
+        if pending_col == "links_external_append":
+            existing = ((await asyncio.to_thread(get_cell, row, "links_external")) or "").strip()
+            parts = [p.strip() for p in existing.split() if p.strip()] if existing else []
+            if str(pending_value) not in parts:
+                parts.append(str(pending_value))
+                await asyncio.to_thread(set_cell, row, "links_external", " ".join(parts))
+            return True
+        if pending_col == "notes_append_line":
+            existing = await asyncio.to_thread(get_cell, row, "notes")
+            merged = ((existing + "\n") if existing else "") + str(pending_value)
+            await asyncio.to_thread(set_cell, row, "notes", merged)
+            return True
+        await asyncio.to_thread(set_cell, row, pending_col, pending_value)
+        return True
+    except Exception:
+        logger.exception("Sheets: deferred write failed (%s)", pending_col)
+        return False
+
+
+async def _safe_set_cell_for_state(st: "OrderState", col_name: str, value, row_snapshot: int = 0, order_id_snapshot: str = "") -> bool:
+    _ensure_pending_updates(st)
+    async with st._sheet_write_lock:
+        row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+        if not row:
+            st._pending_updates.append((col_name, value))
+            return True
+
+        expected_order_id = (getattr(st, "order_id", "") or order_id_snapshot or "").strip()
+        if expected_order_id:
+            try:
+                current_order_id = ((await asyncio.to_thread(get_cell, row, "order_id")) or "").strip()
+            except Exception:
+                current_order_id = ""
+            if current_order_id != expected_order_id:
+                new_row = await asyncio.to_thread(find_row_by_order_id, expected_order_id)
+                if new_row:
+                    row = new_row
+                    st.sheet_row = new_row
+                else:
+                    st._pending_updates.append((col_name, value))
+                    return True
+
+        if getattr(st, "_pending_updates", None):
+            pending = st._pending_updates
+            st._pending_updates = []
+            for pending_col, pending_value in pending:
+                ok = await _apply_pending_update_for_state(row, pending_col, pending_value)
+                if not ok:
+                    st._pending_updates.append((pending_col, pending_value))
+
+        try:
+            await asyncio.to_thread(set_cell, row, col_name, value)
+        except Exception:
+            logger.exception("Sheets set_cell(%s) failed", col_name)
+            st._pending_updates.append((col_name, value))
+        return True
+
+
+async def _append_telegram_file_id_unique_safe_for_state(st: "OrderState", file_id: str, row_snapshot: int = 0, order_id_snapshot: str = "") -> bool:
+    _ensure_pending_updates(st)
+    async with st._sheet_write_lock:
+        row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+        if not row:
+            st._pending_updates.append(("files_telegram_id_append_unique", file_id))
+            return True
+
+        expected_order_id = (getattr(st, "order_id", "") or order_id_snapshot or "").strip()
+        if expected_order_id:
+            try:
+                current_order_id = ((await asyncio.to_thread(get_cell, row, "order_id")) or "").strip()
+            except Exception:
+                current_order_id = ""
+            if current_order_id != expected_order_id:
+                new_row = await asyncio.to_thread(find_row_by_order_id, expected_order_id)
+                if new_row:
+                    row = new_row
+                    st.sheet_row = new_row
+                else:
+                    st._pending_updates.append(("files_telegram_id_append_unique", file_id))
+                    return True
+
+        if getattr(st, "_pending_updates", None):
+            pending = st._pending_updates
+            st._pending_updates = []
+            for pending_col, pending_value in pending:
+                ok = await _apply_pending_update_for_state(row, pending_col, pending_value)
+                if not ok:
+                    st._pending_updates.append((pending_col, pending_value))
+
+        try:
+            await asyncio.to_thread(append_telegram_file_id_unique, row, file_id)
+        except Exception:
+            logger.exception("Sheets append files_telegram_id failed")
+            st._pending_updates.append(("files_telegram_id_append_unique", file_id))
+        return True
+
+
+async def _append_links_safe_for_state(st: "OrderState", urls_to_save: List[str], row_snapshot: int = 0, order_id_snapshot: str = "") -> bool:
+    urls_to_save = [u for u in urls_to_save if u]
+    if not urls_to_save:
+        return True
+    _ensure_pending_updates(st)
+    async with st._sheet_write_lock:
+        row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+        if not row:
+            for url in urls_to_save:
+                st._pending_updates.append(("links_external_append", url))
+            return True
+
+        expected_order_id = (getattr(st, "order_id", "") or order_id_snapshot or "").strip()
+        if expected_order_id:
+            try:
+                current_order_id = ((await asyncio.to_thread(get_cell, row, "order_id")) or "").strip()
+            except Exception:
+                current_order_id = ""
+            if current_order_id != expected_order_id:
+                new_row = await asyncio.to_thread(find_row_by_order_id, expected_order_id)
+                if new_row:
+                    row = new_row
+                    st.sheet_row = new_row
+                else:
+                    for url in urls_to_save:
+                        st._pending_updates.append(("links_external_append", url))
+                    return True
+
+        if getattr(st, "_pending_updates", None):
+            pending = st._pending_updates
+            st._pending_updates = []
+            for pending_col, pending_value in pending:
+                ok = await _apply_pending_update_for_state(row, pending_col, pending_value)
+                if not ok:
+                    st._pending_updates.append((pending_col, pending_value))
+
+        try:
+            existing = ((await asyncio.to_thread(get_cell, row, "links_external")) or "").strip()
+            parts = [p.strip() for p in existing.split() if p.strip()] if existing else []
+            for url in urls_to_save:
+                if url not in parts:
+                    parts.append(url)
+            await asyncio.to_thread(set_cell, row, "links_external", " ".join(parts))
+        except Exception:
+            logger.exception("Sheets append links_external failed")
+            for url in urls_to_save:
+                st._pending_updates.append(("links_external_append", url))
+        return True
+
+
+async def _append_text_note_safe_for_state(st: "OrderState", note_text: str, row_snapshot: int = 0, order_id_snapshot: str = "") -> bool:
+    note_text = (note_text or "").strip()
+    if not note_text:
+        return True
+    _ensure_pending_updates(st)
+    async with st._sheet_write_lock:
+        row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+        if not row:
+            st._pending_updates.append(("notes_append_line", note_text))
+            return True
+
+        expected_order_id = (getattr(st, "order_id", "") or order_id_snapshot or "").strip()
+        if expected_order_id:
+            try:
+                current_order_id = ((await asyncio.to_thread(get_cell, row, "order_id")) or "").strip()
+            except Exception:
+                current_order_id = ""
+            if current_order_id != expected_order_id:
+                new_row = await asyncio.to_thread(find_row_by_order_id, expected_order_id)
+                if new_row:
+                    row = new_row
+                    st.sheet_row = new_row
+                else:
+                    st._pending_updates.append(("notes_append_line", note_text))
+                    return True
+
+        if getattr(st, "_pending_updates", None):
+            pending = st._pending_updates
+            st._pending_updates = []
+            for pending_col, pending_value in pending:
+                ok = await _apply_pending_update_for_state(row, pending_col, pending_value)
+                if not ok:
+                    st._pending_updates.append((pending_col, pending_value))
+
+        try:
+            existing = await asyncio.to_thread(get_cell, row, "notes")
+            merged = existing or ""
+            merged = ((merged + "\n") if merged else "") + note_text
+            await asyncio.to_thread(set_cell, row, "notes", merged)
+        except Exception:
+            logger.exception("Sheets append notes failed")
+            st._pending_updates.append(("notes_append_line", note_text))
+        return True
+
 load_dotenv()
 BOOT_TS = int(time.time())
 ORDER_PREFIX = 'VZ'
@@ -289,11 +521,13 @@ def set_cell(row: int, col_name: str, value):
     if not col:
         logger.warning('Sheets: column %r not found', col_name)
         return
-    ws.update_cell(row, col, str(value))
+    _retry_sheets(ws.update_cell, row, col, str(value))
 
 def get_cell(row: int, col_name: str) -> str:
     col = headers_map(ws).get(col_name)
-    return ws.cell(row, col).value if col else ''
+    if not col:
+        return ''
+    return _retry_sheets(ws.cell, row, col).value
 
 def find_row_by_order_id(order_id: str) -> int:
     """Знаходимо рядок замовлення СТРОГО по order_id (повний збіг) лише в колонці order_id.
@@ -319,7 +553,7 @@ def find_row_by_order_id(order_id: str) -> int:
                 return row
 
         # 2) Оновлюємо кеш (читаємо ТІЛЬКИ колонку order_id)
-        vals = ws.col_values(col)  # 1..N
+        vals = _retry_sheets(ws.col_values, col)  # 1..N
         m = {}
         for i, v in enumerate(vals, start=1):
             key = str(v).strip()
@@ -338,7 +572,7 @@ def find_row_by_order_id(order_id: str) -> int:
 def append_row(values: Dict[str, str]) -> int:
     head = headers_map(ws)
     row_dict = {**{h: '' for h in head.keys()}, **values}
-    ws.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+    _retry_sheets(ws.append_row, [row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
     # invalidate cache so the next lookup sees the newly appended order_id
     ORDER_ROW_CACHE["ts"] = 0.0
     order_id = values.get('order_id')
@@ -718,6 +952,8 @@ class OrderState:
     links_wave_closed: bool = False
     links_wave_task: Optional[asyncio.Task] = None
     links_done_cutoff_ts: float = 0.0
+    upload_step_token: int = 0
+    upload_ui_closed: bool = False
 
     # Legacy fields retained for compatibility with other parts of the bot.
     # They are no longer used by the file/link upload logic but remain to
@@ -753,6 +989,8 @@ def reset_files_wave(st: 'OrderState') -> None:
     accumulate a new wave of file uploads.  This should be called when
     entering the file upload step.
     """
+    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
+    st.upload_ui_closed = False
     st.files_wave_id += 1
     st.files_wave_count = 0
     st.files_wave_last_ts = 0.0
@@ -777,6 +1015,8 @@ def reset_links_wave(st: 'OrderState') -> None:
 
     Similar to reset_files_wave but for external link uploads.
     """
+    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
+    st.upload_ui_closed = False
     st.links_wave_id += 1
     st.links_wave_count = 0
     st.links_wave_last_ts = 0.0
@@ -794,15 +1034,11 @@ def reset_links_wave(st: 'OrderState') -> None:
 
 
 def close_files_wave(st: 'OrderState') -> None:
-    """Forcibly closes the current file wave.
-
-    After calling this no further acknowledgement messages will be scheduled
-    for the current file upload step, and subsequent files will be ignored
-    for the purpose of acknowledgement.  Background tasks for already
-    accepted files will continue to run.
-    """
+    """Forcibly closes the current file wave and its UI context."""
     st.files_wave_closed = True
     st.files_done_cutoff_ts = time.time()
+    st.upload_ui_closed = True
+    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
     task = getattr(st, 'files_wave_task', None)
     if task and not task.done():
         try:
@@ -813,12 +1049,11 @@ def close_files_wave(st: 'OrderState') -> None:
 
 
 def close_links_wave(st: 'OrderState') -> None:
-    """Forcibly closes the current link wave.
-
-    Similar to close_files_wave but for external links.
-    """
+    """Forcibly closes the current link wave and its UI context."""
     st.links_wave_closed = True
     st.links_done_cutoff_ts = time.time()
+    st.upload_ui_closed = True
+    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
     task = getattr(st, 'links_wave_task', None)
     if task and not task.done():
         try:
@@ -912,8 +1147,9 @@ def ensure_files_wave_task(msg: Message, st: 'OrderState') -> None:
     task = getattr(st, 'files_wave_task', None)
     if task is None or task.done():
         wave_id = st.files_wave_id
+        token = int(getattr(st, 'upload_step_token', 0) or 0)
         st.files_wave_task = asyncio.create_task(
-            watch_files_wave(msg.chat.id, st.order_id, wave_id)
+            watch_files_wave(msg.chat.id, st.order_id, wave_id, token)
         )
 
 
@@ -927,12 +1163,13 @@ def ensure_links_wave_task(msg: Message, st: 'OrderState') -> None:
     task = getattr(st, 'links_wave_task', None)
     if task is None or task.done():
         wave_id = st.links_wave_id
+        token = int(getattr(st, 'upload_step_token', 0) or 0)
         st.links_wave_task = asyncio.create_task(
-            watch_links_wave(msg.chat.id, st.order_id, wave_id)
+            watch_links_wave(msg.chat.id, st.order_id, wave_id, token)
         )
 
 
-async def watch_files_wave(chat_id: int, order_id: str, wave_id: int) -> None:
+async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_token: int) -> None:
     """Watches for the end of a file upload wave.
 
     This coroutine periodically checks whether the current wave has ended.  A
@@ -948,6 +1185,10 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int) -> None:
             return
         # if order changed or new wave started, exit
         if st.order_id != order_id or st.files_wave_id != wave_id:
+            return
+        if int(getattr(st, 'upload_step_token', 0) or 0) != upload_token:
+            return
+        if getattr(st, 'upload_ui_closed', False):
             return
         # closed wave or ack already sent -> exit
         if st.files_wave_closed or st.files_wave_ack_sent:
@@ -974,7 +1215,7 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int) -> None:
         return
 
 
-async def watch_links_wave(chat_id: int, order_id: str, wave_id: int) -> None:
+async def watch_links_wave(chat_id: int, order_id: str, wave_id: int, upload_token: int) -> None:
     """Watches for the end of a link upload wave.
 
     Similar to watch_files_wave but for external link uploads.  When the
@@ -987,6 +1228,10 @@ async def watch_links_wave(chat_id: int, order_id: str, wave_id: int) -> None:
         if not st:
             return
         if st.order_id != order_id or st.links_wave_id != wave_id:
+            return
+        if int(getattr(st, 'upload_step_token', 0) or 0) != upload_token:
+            return
+        if getattr(st, 'upload_ui_closed', False):
             return
         if st.links_wave_closed or st.links_wave_ack_sent:
             return
@@ -1118,12 +1363,8 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
             # Write file_id to Sheets with retries
             for attempt in range(3):
                 try:
-                    row = row_snapshot or getattr(st, 'sheet_row', 0)
-                    if not row:
-                        row = find_row_by_order_id(order_id_snapshot)
-                    if row:
-                        await _append_telegram_file_id_unique_async(row, file_id)
-                        await asyncio.to_thread(set_cell, row, 'status', 'files_received')
+                    await _append_telegram_file_id_unique_safe_for_state(st, file_id, row_snapshot, order_id_snapshot)
+                    await _safe_set_cell_for_state(st, 'status', 'files_received', row_snapshot, order_id_snapshot)
                     break
                 except Exception:
                     logger.exception('files_telegram_id write failed, attempt %s/3', attempt + 1)
@@ -1722,13 +1963,17 @@ async def flow(msg: Message):
                 st.last_inline_msg_id = resp.message_id
             return
     if text == '⬅️ Обрати інший спосіб':
-        if st and st.step in ('await_tele_files', 'await_links', 'email_wait_done'):
+        if st and st.step in ('await_tele_files', 'await_links', 'email_wait_done') and not getattr(st, 'upload_ui_closed', False):
             st.step = 'choose_files_method'
+            st.upload_ui_closed = True
+            st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
             await _clear_inline_markup(msg)
             await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             return
-    allowed_done_states = {'await_tele_files', 'await_links', 'email_wait_done', 'await_notes'}
+    allowed_done_states = {'await_tele_files', 'await_links', 'email_wait_done', 'await_notes', 'await_notes_choice'}
     if text == '✅ Готово' and (not st or st.step not in allowed_done_states):
+        if st and getattr(st, 'upload_ui_closed', False):
+            return
         await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         if st:
@@ -1738,9 +1983,6 @@ async def flow(msg: Message):
     if not st:
         state_by_chat[msg.chat.id] = OrderState()
         return await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
-    if msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO) and st.file_tail_open and st.step != 'await_tele_files':
-        await handle_telegram_upload(msg, st, silent=True, is_tail=True)
-        return
     if st and st.step == 'await_notes_choice':
         choice = (msg.text or '').strip()
         if choice == '✅ Готово':
@@ -2081,12 +2323,8 @@ async def flow(msg: Message):
         async def _save_links_best_effort(urls_to_save: List[str], row_snapshot: int, order_id_snapshot: str):
             try:
                 if urls_to_save:
-                    row = row_snapshot or getattr(st, 'sheet_row', 0)
-                    if not row:
-                        row = find_row_by_order_id(order_id_snapshot)
-                    if row:
-                        await asyncio.to_thread(update_joined, row, 'links_external', urls_to_save)
-                        await asyncio.to_thread(set_cell, row, 'status', 'files_received')
+                    await _append_links_safe_for_state(st, urls_to_save, row_snapshot, order_id_snapshot)
+                    await _safe_set_cell_for_state(st, 'status', 'files_received', row_snapshot, order_id_snapshot)
             except Exception:
                 logger.exception('links best-effort save failed')
         row_snapshot = getattr(st, 'sheet_row', 0)
@@ -2107,6 +2345,8 @@ async def flow(msg: Message):
             return
     if st.step == 'email_wait_done':
         if (msg.text or '').strip() == '✅ Готово':
+            st.upload_ui_closed = True
+            st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
             set_cell(st.sheet_row, 'status', 'files_expected')
             set_cell(st.sheet_row, 'email_sent', 'Yes')
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -2125,8 +2365,12 @@ async def flow(msg: Message):
             st.accepted_notes_count += 1
             async def _save_voice_best_effort():
                 try:
-                    prev = get_cell(st.sheet_row, 'voice_id')
-                    set_cell(st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
+                    row_snapshot = getattr(st, 'sheet_row', 0)
+                    order_id_snapshot = st.order_id
+                    row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+                    if row:
+                        prev = await asyncio.to_thread(get_cell, row, 'voice_id')
+                        await _safe_set_cell_for_state(st, 'voice_id', (prev + ' ' if prev else '') + file_id_tg, row, order_id_snapshot)
                     file = await bot.get_file(file_id_tg)
                     buf = await bot.download_file(file.file_path)
                     if hasattr(buf, 'read'):
@@ -2141,8 +2385,10 @@ async def flow(msg: Message):
                         data = bio.getvalue()
                     fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
                     _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
-                    prev_link = get_cell(st.sheet_row, 'voice_link')
-                    set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
+                    row = await _resolve_sheet_row_for_state(st, row_snapshot, order_id_snapshot)
+                    if row:
+                        prev_link = await asyncio.to_thread(get_cell, row, 'voice_link')
+                        await _safe_set_cell_for_state(st, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink, row, order_id_snapshot)
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
@@ -2153,8 +2399,9 @@ async def flow(msg: Message):
             note_text = (msg.text or '')
             async def _save_note_best_effort():
                 try:
-                    prev = get_cell(st.sheet_row, 'notes')
-                    set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
+                    row_snapshot = getattr(st, 'sheet_row', 0)
+                    order_id_snapshot = st.order_id
+                    await _append_text_note_safe_for_state(st, note_text, row_snapshot, order_id_snapshot)
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
