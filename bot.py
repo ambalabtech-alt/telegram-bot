@@ -191,8 +191,8 @@ assert NOVAPOSHTA_API_KEY, 'NOVAPOSHTA_API_KEY is empty'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/view?usp=drive_link'
 FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
-# The FILE_TAIL_TIMEOUT_SEC constant and related tail window logic have been removed.
-FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '15'))  # unused
+FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '15'))
+FILES_DONE_GRACE_SEC = float(os.getenv('FILES_DONE_GRACE_SEC', '3.0'))
 BOT_STATE_SHEET_NAME = os.getenv('BOT_STATE_SHEET_NAME', '_bot_state')
 
 # -----------------------------------------------------------------------------
@@ -723,21 +723,10 @@ class OrderState:
     links_done_cutoff_ts: float = 0.0
     upload_step_token: int = 0
     upload_ui_closed: bool = False
-
-    # Flags to control when the user may press the “✅ Готово” button.
-    # During a file or link upload step the button should only work after
-    # the bot has acknowledged the current wave of uploads (see
-    # watch_files_wave/watch_links_wave).  These flags are reset to False
-    # whenever a new file or link arrives and set to True by the watcher
-    # once it sends the acknowledgement message.
     files_done_allowed: bool = False
     links_done_allowed: bool = False
-    # Lock used to prevent double-handling of the Done action.  When the
-    # user presses “✅ Готово” and the action is processed, this flag is
-    # temporarily set to True.  It is reset when the next step begins.
     done_lock: bool = False
-    # Legacy fields removed: the bot no longer supports tail uploads or batch
-    # acknowledgements for file/link uploads.
+    files_done_task: Optional[asyncio.Task] = None
     accepted_files_count: int = 0
     accepted_links_count: int = 0
     accepted_notes_count: int = 0
@@ -770,7 +759,15 @@ def reset_files_wave(st: 'OrderState') -> None:
     st.files_wave_ack_sent = False
     st.files_wave_closed = False
     st.files_done_cutoff_ts = 0.0
-    # Legacy flags files_done_pressed, file_tail_open and last_file_update_ts removed.
+    st.files_done_allowed = False
+    st.done_lock = False
+    task = getattr(st, 'files_done_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.files_done_task = None
     st.files_seen_keys.clear()
     st.files_active_media_group_id = ''
     st.files_active_media_group_last_ts = 0.0
@@ -797,6 +794,7 @@ def reset_links_wave(st: 'OrderState') -> None:
     st.links_wave_ack_sent = False
     st.links_wave_closed = False
     st.links_done_cutoff_ts = 0.0
+    st.links_done_allowed = False
     # cancel old watcher
     task = getattr(st, 'links_wave_task', None)
     if task and not task.done():
@@ -811,7 +809,6 @@ def close_files_wave(st: 'OrderState') -> None:
     """Forcibly closes the current file wave and its UI context."""
     st.files_wave_closed = True
     st.files_done_cutoff_ts = time.time()
-    # Legacy flags files_done_pressed, file_tail_open and last_file_update_ts removed.
     st.upload_ui_closed = True
     st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
     task = getattr(st, 'files_wave_task', None)
@@ -836,6 +833,44 @@ def close_links_wave(st: 'OrderState') -> None:
         except Exception:
             pass
     st.links_wave_task = None
+
+
+def _cancel_pending_files_done(st: 'OrderState') -> None:
+    task = getattr(st, 'files_done_task', None)
+    if task and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    st.files_done_task = None
+
+
+async def _finalize_files_step_after_grace(chat_id: int, order_id: str, upload_token: int) -> None:
+    try:
+        await asyncio.sleep(FILES_DONE_GRACE_SEC)
+    except asyncio.CancelledError:
+        return
+    st = state_by_chat.get(chat_id)
+    if not st:
+        return
+    if st.order_id != order_id or st.step != 'await_tele_files':
+        return
+    if int(getattr(st, 'upload_step_token', 0) or 0) != upload_token:
+        return
+    if not getattr(st, 'done_lock', False):
+        return
+    close_files_wave(st)
+    try:
+        set_cell(st.sheet_row, 'status', 'files_expected')
+    except Exception:
+        logger.exception('Failed to set files_expected after upload grace window')
+    st.step = 'await_notes_choice'
+    st.done_lock = False
+    await save_bot_state_async(chat_id, st)
+    try:
+        await bot.send_message(chat_id, 'Хочете додати текстові пояснення або голосове повідомлення?', reply_markup=notes_yesno_kb())
+    except Exception:
+        logger.exception('Failed to send notes choice after files grace window')
 
 
 def build_file_event_key(msg: Message) -> str:
@@ -984,7 +1019,6 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
         # send ack
         try:
             await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
-            # Mark the current wave as acknowledged and enable the Done button.
             st.files_wave_ack_sent = True
             st.files_done_allowed = True
         except Exception:
@@ -1019,25 +1053,11 @@ async def watch_links_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
             continue
         try:
             await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
-            # Mark the current link wave as acknowledged and enable the Done button.
             st.links_wave_ack_sent = True
             st.links_done_allowed = True
         except Exception:
             logger.exception('links wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
         return
-
-# The file tail window logic has been removed.  Late uploads after the user presses Done are no longer accepted.
-
-def append_telegram_file_id_unique(row: int, file_id: str) -> str:
-    prev = (get_cell(row, 'files_telegram_id') or '').strip()
-    parts = [p.strip() for p in prev.split() if p.strip()]
-    if file_id not in parts:
-        parts.append(file_id)
-        set_cell(row, 'files_telegram_id', ' '.join(parts))
-    return ' '.join(parts)
-
-# The batch acknowledgement logic has been removed.  Waves are acknowledged
-# exclusively through the watch_files_wave/watch_links_wave coroutine.
 
 async def _append_telegram_file_id_unique_async(row: int, file_id: str) -> str:
     return await asyncio.to_thread(append_telegram_file_id_unique, row, file_id)
@@ -1057,9 +1077,10 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     # Do not process if channel is not configured
     if not FILES_CHANNEL_ID:
         return False
-    # Whenever a new file arrives we consider the current wave incomplete and
-    # disable the Done button.  We no longer support a tail window for late
-    # uploads; once the user presses Done no further files are accepted.
+    # A new file means the user started a new wave.  Any pending Done action
+    # must be cancelled until this wave is fully received and acknowledged.
+    _cancel_pending_files_done(st)
+    st.done_lock = False
     if st.files_wave_closed:
         return False
     # Validate file size for documents
@@ -1075,12 +1096,8 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     if file_id not in st.telegram_file_ids:
         st.telegram_file_ids.append(file_id)
         st.accepted_files_count += 1
-        # A new unique file disables the Done button until the wave is acknowledged.
-        st.files_done_allowed = False
-    # Update wave state and ensure watcher for the live upload step.  Every
-    # file received while on the file upload step starts or extends the
-    # current wave.  Once the wave goes quiet the watcher will send the
-    # acknowledgement and enable the Done button.
+    st.files_done_allowed = False
+    # Update wave state and ensure watcher for the live upload step.
     touch_files_wave(st, msg)
     ensure_files_wave_task(msg, st)
     # Prepare caption for channel posting
@@ -1553,8 +1570,6 @@ async def new_order(msg: Message):
         await save_bot_state_async(msg.chat.id, st)
 
 async def ask_notes(msg: Message, st: OrderState):
-    # Reset the Done lock when entering the notes step so that the Done button
-    # can be used again in this new context.
     st.done_lock = False
     await msg.answer('Хочете додати текстові пояснення або голосове повідомлення?', reply_markup=notes_yesno_kb())
     st.step = 'await_notes_choice'
@@ -1563,7 +1578,6 @@ async def ask_notes(msg: Message, st: OrderState):
 async def finalize_order(msg: Message, st: OrderState):
     if getattr(st, 'finalized', False):
         return
-    # Batch acknowledgement invalidation removed
     st.finalized = True
     try:
         if getattr(st, 'sheet_row', 0):
@@ -1582,9 +1596,6 @@ async def flow(msg: Message):
         st = await load_bot_state_async(msg.chat.id)
         if st:
             state_by_chat[msg.chat.id] = st
-    if st:
-        # Tail window refresh removed
-        pass
 
     # Додатковий захист: URL/посилання поза сценарієм — також у Головне меню
     if msg.content_type == 'text':
@@ -1609,7 +1620,6 @@ async def flow(msg: Message):
     if msg.content_type != 'text':
         expecting_file = st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
         expecting_voice = st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE
-        # Tail file support removed: uploads after Done are no longer accepted.
         if not (expecting_file or expecting_voice):
             if st is not None:
                 handled = await _warn_or_reset_to_menu(msg, st)
@@ -1714,7 +1724,6 @@ async def flow(msg: Message):
             return
     allowed_done_states = {'await_tele_files', 'await_links', 'email_wait_done', 'await_notes', 'await_notes_choice'}
     if text == '✅ Готово' and (not st or st.step not in allowed_done_states):
-        # Ignore Done presses outside of upload or note steps.
         return
     if not st:
         state_by_chat[msg.chat.id] = OrderState()
@@ -1995,6 +2004,7 @@ async def flow(msg: Message):
             # Reset file wave state and counters
             reset_files_wave(st)
             st.accepted_files_count = 0
+            st.files_done_allowed = False
             await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
             await save_bot_state_async(msg.chat.id, st)
@@ -2004,6 +2014,7 @@ async def flow(msg: Message):
             # Reset link wave state and counters
             reset_links_wave(st)
             st.accepted_links_count = 0
+            st.links_done_allowed = False
             st.pending_links = []
             await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_links'
@@ -2030,11 +2041,9 @@ async def flow(msg: Message):
         return
     if st.step == 'await_links':
         if (msg.text or '').strip() == '✅ Готово':
-            # Do not allow completion if the current link wave has not yet been acknowledged.
             if not st.links_done_allowed:
                 await msg.answer('Зачекайте, поки всі посилання будуть завантажені та збережені.', reply_markup=files_aux_kb())
                 return
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
@@ -2047,7 +2056,6 @@ async def flow(msg: Message):
             close_links_wave(st)
             set_cell(st.sheet_row, 'status', 'files_expected')
             await ask_notes(msg, st)
-            # Release the lock for subsequent steps
             st.done_lock = False
             return
         urls = extract_urls(msg.text or '')
@@ -2064,7 +2072,6 @@ async def flow(msg: Message):
                 new_urls.append(u)
         # Update wave state and ensure watcher
         if new_urls:
-            # Any new link disables the Done button until the wave is acknowledged.
             st.links_done_allowed = False
             touch_links_wave(st, len(new_urls))
             ensure_links_wave_task(msg, st)
@@ -2086,21 +2093,16 @@ async def flow(msg: Message):
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
-            # Do not allow completion if the current file wave has not yet been acknowledged.
             if not st.files_done_allowed:
                 await msg.answer('Зачекайте, поки всі файли будуть завантажені та збережені.', reply_markup=files_aux_kb())
                 return
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
-            # Proceed to close the current wave and move to notes
-            close_files_wave(st)
-            set_cell(st.sheet_row, 'status', 'files_expected')
-            await save_bot_state_async(msg.chat.id, st)
-            await ask_notes(msg, st)
-            # Release the lock for subsequent steps
-            st.done_lock = False
+            _cancel_pending_files_done(st)
+            st.files_done_task = asyncio.create_task(
+                _finalize_files_step_after_grace(msg.chat.id, st.order_id, int(getattr(st, 'upload_step_token', 0) or 0))
+            )
             return
     if st.step == 'email_wait_done':
         if (msg.text or '').strip() == '✅ Готово':
@@ -2109,7 +2111,6 @@ async def flow(msg: Message):
             set_cell(st.sheet_row, 'status', 'files_expected')
             set_cell(st.sheet_row, 'email_sent', 'Yes')
             set_cell(st.sheet_row, 'status', 'files_expected')
-            # Batch acknowledgement invalidation removed
             await ask_notes(msg, st)
             return
     if st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO):
@@ -2117,7 +2118,6 @@ async def flow(msg: Message):
         return
     if st.step == 'await_notes':
         if (msg.text or '').strip() == '✅ Готово':
-            # When the user is done with notes, finalize the order.
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
@@ -2145,11 +2145,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            # After saving the voice note inform the user they may continue or finish.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
+            await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -2161,11 +2157,7 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            # Inform the user after each note.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
+            await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
