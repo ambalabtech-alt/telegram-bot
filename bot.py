@@ -270,6 +270,55 @@ def append_files_method(row: int, method_key: str):
 
 HEADERS_CACHE: Dict[str, Dict[str, int]] = {}
 
+# --- Doctor phone caching -----------------------------------------------------
+#
+# A simple in-memory cache for mapping Telegram chat IDs to the doctor's phone
+# number.  Loading phone numbers from Google Sheets on each order introduces
+# noticeable latency.  Instead, we populate this cache once at startup and
+# consult it on every order.  When a doctor enters their phone number for
+# the first time, we update the cache immediately and persist it to Sheets
+# asynchronously in the background.  The cache lives for the lifetime of the
+# process; it is rebuilt on restart via `warmup_doctor_phone_cache()`.
+
+DOCTOR_PHONE_CACHE: Dict[str, str] = {}
+
+def warmup_doctor_phone_cache() -> None:
+    """
+    Populate DOCTOR_PHONE_CACHE with all chat_id → phone mappings from Лист2.
+
+    This function performs a single read of the NP profiles worksheet to
+    reconstruct the entire mapping.  It should be called once when the bot
+    starts (for example in `_main()`) to avoid repeated expensive scans of
+    Google Sheets on every order.  On any error, the cache is left empty.
+    """
+    global DOCTOR_PHONE_CACHE
+    try:
+        ws2 = np_profiles_ws()
+        head = np_head(ws2)
+        chat_col = head.get('chat_id')
+        phone_col = head.get('phone')
+        if not (chat_col and phone_col):
+            DOCTOR_PHONE_CACHE = {}
+            return
+        # Read chat_id and phone columns.  If phone column is shorter, missing
+        # entries default to empty string.
+        chat_vals = ws2.col_values(chat_col)
+        phone_vals = ws2.col_values(phone_col)
+        cache: Dict[str, str] = {}
+        for i, chat_id_val in enumerate(chat_vals):
+            cid = str(chat_id_val or '').strip()
+            if not cid:
+                continue
+            ph_val = phone_vals[i] if i < len(phone_vals) else ''
+            ph = str(ph_val or '').strip()
+            if ph:
+                cache[cid] = ph
+        DOCTOR_PHONE_CACHE = cache
+    except Exception as e:
+        logger.exception("Failed to warmup doctor phone cache: %s", e)
+        DOCTOR_PHONE_CACHE = {}
+
+
 def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
     if force or cache_key not in HEADERS_CACHE:
         HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(_retry_sheets(ws_.row_values, 1))}
@@ -576,29 +625,17 @@ def np_save_current_delivery(chat_id: int, st):
         pass
 
 def doctor_phone_get(chat_id: int) -> str:
-    """Return doctor's personal phone for chat_id if present in Лист2; else empty string."""
-    ws2 = np_profiles_ws()
-    head = np_head(ws2)
-    chat_col = head.get('chat_id')
-    phone_col = head.get('phone')
-    if not (chat_col and phone_col):
-        return ''
-    try:
-        col_vals = ws2.col_values(chat_col)
-    except Exception:
-        return ''
-    target = str(chat_id).strip()
-    match_rows = [idx + 1 for idx, val in enumerate(col_vals) if str(val).strip() == target]
-    if not match_rows:
-        return ''
-    for row_idx in reversed(match_rows):
-        try:
-            ph = ws2.cell(row_idx, phone_col).value
-            if str(ph or '').strip():
-                return str(ph).strip()
-        except Exception:
-            continue
-    return ''
+    """
+    Return the cached doctor's phone number for the given chat_id.
+
+    Instead of hitting Google Sheets on every call, this function looks up
+    the phone number in the in-memory DOCTOR_PHONE_CACHE.  If the cache
+    contains an entry for the provided chat_id, the corresponding phone
+    number is returned; otherwise an empty string is returned.  The cache
+    is populated at startup via `warmup_doctor_phone_cache()` and updated
+    whenever a doctor enters their phone number for the first time.
+    """
+    return DOCTOR_PHONE_CACHE.get(str(chat_id).strip(), '')
 
 def doctor_phone_create(chat_id: int, phone: str):
     """
@@ -633,6 +670,46 @@ def doctor_phone_create(chat_id: int, phone: str):
     if head.get('updated_at'):
         row_dict['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
     ws2.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+
+# -----------------------------------------------------------------------------
+# Asynchronous persistence for doctor phone numbers
+
+async def doctor_phone_save_bg(chat_id: int, phone: str) -> None:
+    """
+    Persist the doctor's phone number to Лист2 in the background.
+
+    This coroutine attempts to append a new row to the NP profiles sheet via
+    `doctor_phone_create()` until it succeeds or until roughly 10 seconds have
+    elapsed.  It runs `doctor_phone_create()` in a thread to avoid blocking
+    the event loop.  After a successful write, it updates the global
+    DOCTOR_PHONE_CACHE so future orders skip asking for the phone again.  If
+    the sheet cannot be updated within the time window, the exception is
+    logged and the cache remains untouched (though the in-memory cache may
+    already have been updated optimistically in the calling context).
+    """
+    start = time.monotonic()
+    attempt = 0
+    # Normalize inputs once
+    chat_id_str = str(chat_id).strip()
+    phone_str = str(phone).strip()
+    while True:
+        try:
+            # doctor_phone_create() handles idempotence: it does nothing if the
+            # chat_id already exists.  Run it in a thread pool to avoid
+            # blocking the event loop with synchronous I/O.
+            await asyncio.to_thread(doctor_phone_create, chat_id, phone_str)
+            # Update cache on success
+            DOCTOR_PHONE_CACHE[chat_id_str] = phone_str
+            return
+        except Exception as e:
+            attempt += 1
+            # Stop retrying after 10 seconds total
+            if time.monotonic() - start > 10:
+                logger.exception("Failed to save doctor phone for chat_id %s after %s attempts: %s", chat_id, attempt, e)
+                return
+            # Wait an exponentially increasing amount of time, capped at 5s
+            delay = min(1 * (2 ** attempt), 5)
+            await asyncio.sleep(delay)
 
 def np_profiles_list(chat_id: int) -> List[dict]:
     """1 read for whole chat_id column + 1 per matched row. No external helpers."""
@@ -1853,11 +1930,16 @@ async def flow(msg: Message):
         if not re.fullmatch(r'^\+?[1-9]\d{11,14}$', txt_norm):
             await msg.answer('Вкажіть номер телефону у міжнародному форматі (наприклад, +380XXXXXXXXX).')
             return
-        if not await _safe_set_cell(st.sheet_row, 'phone', txt_norm, msg): return
-        try:
-            doctor_phone_create(msg.chat.id, txt_norm)
-        except Exception:
-            pass
+        # Write the phone to the order row in Лист1.  Do not block on Sheets errors.
+        if not await _safe_set_cell(st.sheet_row, 'phone', txt_norm, msg):
+            return
+        # Immediately update the in-memory cache to avoid re-asking for the phone
+        # during this session.  Persist the new phone to Лист2 asynchronously.
+        DOCTOR_PHONE_CACHE[str(msg.chat.id).strip()] = txt_norm
+        # Schedule background persistence with retries up to 10 seconds.  The
+        # coroutine is detached via create_task to avoid blocking the flow.
+        asyncio.create_task(doctor_phone_save_bg(msg.chat.id, txt_norm))
+        # Prompt for the next step without waiting for the background task
         await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
         st.step = 'patient_lastname'
         await save_bot_state_async(msg.chat.id, st)
@@ -2595,6 +2677,13 @@ async def _midnight_scheduler():
 async def main():
     logger.info('Starting AmbaLab Bot...')
     # asyncio.create_task(_midnight_scheduler())   # тимчасово вимкнули
+    # Before starting polling, warm up the doctor phone cache.  This loads
+    # existing chat_id → phone mappings from Лист2 so the bot does not have
+    # to scan the sheet for each new order.
+    try:
+        warmup_doctor_phone_cache()
+    except Exception:
+        logger.exception('Doctor phone cache warmup failed')
     await dp.start_polling(bot)
 
 # --- Cloud Run entrypoint: HTTP server + aiogram polling ---
@@ -2615,6 +2704,14 @@ async def _main():
     # asyncio.create_task(_midnight_scheduler())   # тимчасово вимкнули
 
     # 2) Запускаємо бота в режимі polling
+    # Перед запуском бота прогріваємо кеш телефонів лікарів.  Це зчитує Лист2
+    # один раз та наповнює DOCTOR_PHONE_CACHE, щоб уникнути гальм під час
+    # створення замовлень.  Якщо прогрів не вдається, ми залишимо кеш порожнім
+    # і будемо поводитись так, ніби у профілі немає телефонів.
+    try:
+        warmup_doctor_phone_cache()
+    except Exception:
+        logger.exception('Doctor phone cache warmup failed')
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
