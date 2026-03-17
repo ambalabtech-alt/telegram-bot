@@ -502,6 +502,9 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         else:
             # Notes or voice messages already exist – stay in await_notes so the doctor can add more or press Done
             st.step = 'await_notes'
+        if 'telegram_upload' in files_method and st.accepted_files_count > 0:
+            st.files_done_allowed = True
+            st.files_wave_ack_sent = True
         return st
     except Exception:
         logger.exception('Order restore from sheet failed')
@@ -1060,10 +1063,10 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
             continue
         # send ack
         try:
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
             # Mark the current wave as acknowledged and enable the Done button.
             st.files_wave_ack_sent = True
             st.files_done_allowed = True
+            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
         except Exception:
             logger.exception('files wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
         return
