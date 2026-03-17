@@ -502,9 +502,6 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         else:
             # Notes or voice messages already exist – stay in await_notes so the doctor can add more or press Done
             st.step = 'await_notes'
-        if 'telegram_upload' in files_method and st.accepted_files_count > 0:
-            st.files_done_allowed = True
-            st.files_wave_ack_sent = True
         return st
     except Exception:
         logger.exception('Order restore from sheet failed')
@@ -1063,10 +1060,10 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
             continue
         # send ack
         try:
+            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
             # Mark the current wave as acknowledged and enable the Done button.
             st.files_wave_ack_sent = True
             st.files_done_allowed = True
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
         except Exception:
             logger.exception('files wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
         return
@@ -1137,10 +1134,8 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     # Do not process if channel is not configured
     if not FILES_CHANNEL_ID:
         return False
-    # Whenever a new file arrives we consider the current wave incomplete and
-    # disable the Done button.  We no longer support a tail window for late
-    # uploads; once the user presses Done no further files are accepted.
-    if st.files_wave_closed:
+    # Once the step has been closed we no longer accept files for this upload method.
+    if st.step != 'await_tele_files':
         return False
     # Validate file size for documents
     if msg.content_type == ContentType.DOCUMENT:
@@ -1155,14 +1150,6 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     if file_id not in st.telegram_file_ids:
         st.telegram_file_ids.append(file_id)
         st.accepted_files_count += 1
-        # A new unique file disables the Done button until the wave is acknowledged.
-        st.files_done_allowed = False
-    # Update wave state and ensure watcher for the live upload step.  Every
-    # file received while on the file upload step starts or extends the
-    # current wave.  Once the wave goes quiet the watcher will send the
-    # acknowledgement and enable the Done button.
-    touch_files_wave(st, msg)
-    ensure_files_wave_task(msg, st)
     # Prepare caption for channel posting
     caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
     async def _post_file_best_effort(row_snapshot: int, order_id_snapshot: str):
@@ -1237,7 +1224,7 @@ def bottom_nav_kb() -> ReplyKeyboardMarkup:
 def files_aux_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
 
-async def _refresh_done_keyboard(msg: Message, text: str = 'Можете надсилати ще або натисніть «✅ Готово».') -> None:
+async def _refresh_done_keyboard(msg: Message, text: str = 'Коли завершите, натисніть «✅ Готово».') -> None:
     """Force Telegram clients to reopen reply keyboard for note steps."""
     try:
         await msg.answer('‎', reply_markup=ReplyKeyboardRemove())
@@ -1636,7 +1623,7 @@ async def ask_notes(msg: Message, st: OrderState):
     # Reset the Done lock when entering the notes step so that the Done button
     # can be used again in this new context.
     st.done_lock = False
-    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення?', reply_markup=notes_yesno_kb())
+    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', reply_markup=notes_yesno_kb())
     st.step = 'await_notes_choice'
     await save_bot_state_async(msg.chat.id, st)
 
@@ -1777,7 +1764,28 @@ async def flow(msg: Message):
                 return
 
             else:
-                reprompt_map = {'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()), 'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()), 'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()), 'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()), 'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))), 'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()), 'await_tele_files': ('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', files_aux_kb()), 'await_links': ('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', files_aux_kb()), 'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()), 'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення?', notes_yesno_kb()), 'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', done_kb())}
+                reprompt_map = {
+                    'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()),
+                    'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()),
+                    'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()),
+                    'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()),
+                    'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))),
+                    'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()),
+                    'await_tele_files': (
+                        '📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження\nі натисніть «✅ Готово».',
+                        files_aux_kb(),
+                    ),
+                    'await_links': (
+                        '🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання -\nнатисніть «✅ Готово».',
+                        files_aux_kb(),
+                    ),
+                    'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите - натисніть «✅ Готово».', done_kb()),
+                    'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', notes_yesno_kb()),
+                    'await_notes': (
+                        '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».',
+                        done_kb(),
+                    ),
+                }
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
                 resp = await msg.answer(hint, reply_markup=kb, parse_mode='HTML')
             st = state_by_chat.get(msg.chat.id)
@@ -1804,7 +1812,7 @@ async def flow(msg: Message):
         if choice == '✅ Готово':
             return
         if choice == 'Так':
-            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
+            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
             st.step = 'await_notes'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2077,20 +2085,22 @@ async def flow(msg: Message):
         t = msg.text or ''
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
-            # Reset file wave state and counters
-            reset_files_wave(st)
             st.accepted_files_count = 0
-            await msg.answer('📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
+            await msg.answer("""📎 <b>Надішліть файли</b> (можна кілька)
+
+Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження
+і натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
             await save_bot_state_async(msg.chat.id, st)
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
-            # Reset link wave state and counters
-            reset_links_wave(st)
             st.accepted_links_count = 0
             st.pending_links = []
-            await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
+            await msg.answer("""🔗 <b>Надішліть посилання</b> (можна кілька)
+
+Коли відправите <b>ВСІ</b> посилання -
+натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_links'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2100,7 +2110,13 @@ async def flow(msg: Message):
                 set_cell(st.sheet_row, 'email', LAB_EMAIL)
             lastname = getattr(st, 'patient_lastname', '') or ''
             subject = f'AmbaLab order {nz(st.order_id)} - {lastname}' if lastname else f'AmbaLab order {nz(st.order_id)}'
-            text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
+            text = f"""Скопіюйте електронну адресу і тему листа
+
+📧 <code>{LAB_EMAIL}</code>
+
+🧾 <code>{subject}</code>
+
+Після відправлення листа натисніть «✅ Готово»."""
             await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
             await save_bot_state_async(msg.chat.id, st)
@@ -2115,45 +2131,27 @@ async def flow(msg: Message):
         return
     if st.step == 'await_links':
         if (msg.text or '').strip() == '✅ Готово':
-            # Do not allow completion if the current link wave has not yet been acknowledged.
-            if not st.links_done_allowed:
-                await msg.answer('Зачекайте, поки всі посилання будуть завантажені та збережені.', reply_markup=files_aux_kb())
-                return
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
-            # If no links were accepted, ask the user to provide at least one
             if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
-            # Close the current wave and update Sheets
-            close_links_wave(st)
             set_cell(st.sheet_row, 'status', 'files_expected')
             await ask_notes(msg, st)
-            # Release the lock for subsequent steps
             st.done_lock = False
             return
         urls = extract_urls(msg.text or '')
-        # If no URLs are detected, prompt the user to send a valid link
         if not urls:
             await msg.answer('Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
             return
-        # Collect new URLs (deduplicated within this session)
         new_urls: List[str] = []
         for u in urls:
             if u not in st.pending_links:
                 st.pending_links.append(u)
                 st.accepted_links_count += 1
                 new_urls.append(u)
-        # Update wave state and ensure watcher
-        if new_urls:
-            # Any new link disables the Done button until the wave is acknowledged.
-            st.links_done_allowed = False
-            touch_links_wave(st, len(new_urls))
-            ensure_links_wave_task(msg, st)
-        # Save links to Sheets in the background
         async def _save_links_best_effort(urls_to_save: List[str], row_snapshot: int, order_id_snapshot: str):
             try:
                 if urls_to_save:
@@ -2171,20 +2169,16 @@ async def flow(msg: Message):
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
-            # Do not allow completion if the current file wave has not yet been acknowledged.
-            if not st.files_done_allowed:
-                await msg.answer('Зачекайте, поки всі файли будуть завантажені та збережені.', reply_markup=files_aux_kb())
-                return
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
-            # Proceed to close the current wave and move to notes
-            close_files_wave(st)
+            if st.accepted_files_count <= 0 and not st.telegram_file_ids and not (get_cell(st.sheet_row, 'files_telegram_id') or '').strip():
+                await msg.answer('Поки що файлів не додано. Надішліть хоча б один файл або оберіть інший спосіб.', reply_markup=files_aux_kb())
+                st.done_lock = False
+                return
             set_cell(st.sheet_row, 'status', 'files_expected')
             await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
-            # Release the lock for subsequent steps
             st.done_lock = False
             return
     if st.step == 'email_wait_done':
@@ -2202,7 +2196,6 @@ async def flow(msg: Message):
         return
     if st.step == 'await_notes':
         if (msg.text or '').strip() == '✅ Готово':
-            # When the user is done with notes, finalize the order.
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
@@ -2230,11 +2223,6 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            # After saving the voice note inform the user they may continue or finish.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -2246,11 +2234,6 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            # Inform the user after each note.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
@@ -2284,7 +2267,7 @@ def np_detect_kind(s: str):
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
     st = state_by_chat.get(q.message.chat.id)
-    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
+    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
     st.step = 'await_notes'
     await save_bot_state_async(q.message.chat.id, st)
     await q.answer()
