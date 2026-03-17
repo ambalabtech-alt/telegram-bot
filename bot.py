@@ -1060,7 +1060,8 @@ async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
             continue
         # send ack
         try:
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
+            # Prepend a zero-width non-joiner so the reply keyboard is displayed correctly
+            await bot.send_message(chat_id, '\u2060' + 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
             # Mark the current wave as acknowledged and enable the Done button.
             st.files_wave_ack_sent = True
             st.files_done_allowed = True
@@ -1095,7 +1096,8 @@ async def watch_links_wave(chat_id: int, order_id: str, wave_id: int, upload_tok
         if silence < LINKS_WAVE_SILENCE_SEC:
             continue
         try:
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
+            # Prepend a zero-width non-joiner so the reply keyboard is displayed correctly
+            await bot.send_message(chat_id, '\u2060' + 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
             # Mark the current link wave as acknowledged and enable the Done button.
             st.links_wave_ack_sent = True
             st.links_done_allowed = True
@@ -1234,7 +1236,8 @@ async def _refresh_done_keyboard(msg: Message, text: str = 'Коли завер�
         await asyncio.sleep(0.2)
     except Exception:
         pass
-    await msg.answer(text, reply_markup=done_kb(), parse_mode='HTML')
+    # Prepend a zero-width non-joiner to ensure the reply keyboard reopens on some clients
+    await msg.answer('\u2060' + text, reply_markup=done_kb(), parse_mode='HTML')
 NP_MENU_ADD = '✏️ Додати нову адресу'
 NP_MENU_USE_SAVED = '📦 На збережену адресу'
 NP_MENU_SKIP = '⏭️ Пропустити'
@@ -1760,7 +1763,8 @@ async def flow(msg: Message):
                 lastname = getattr(st, 'patient_lastname', '') or ''
                 subject = f'AmbaLab order {nz(st.order_id)} - {lastname}' if lastname else f'AmbaLab order {nz(st.order_id)}'
                 text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
-                await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
+                # Prepend a zero-width non-joiner to ensure the reply keyboard appears
+                await msg.answer('\u2060' + text, parse_mode='HTML', reply_markup=files_aux_kb())
                 return
 
             else:
@@ -1787,7 +1791,8 @@ async def flow(msg: Message):
                     ),
                 }
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
-                resp = await msg.answer(hint, reply_markup=kb, parse_mode='HTML')
+                # Prepend a zero-width non-joiner to ensure the reply keyboard appears reliably
+                resp = await msg.answer('\u2060' + hint, reply_markup=kb, parse_mode='HTML')
             st = state_by_chat.get(msg.chat.id)
             if st:
                 st.last_inline_msg_id = resp.message_id
@@ -2086,7 +2091,7 @@ async def flow(msg: Message):
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
             st.accepted_files_count = 0
-            await msg.answer("""📎 <b>Надішліть файли</b> (можна кілька)
+            await msg.answer('\u2060' + """📎 <b>Надішліть файли</b> (можна кілька)
 
 Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження
 і натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
@@ -2097,7 +2102,7 @@ async def flow(msg: Message):
             append_files_method(st.sheet_row, 'link')
             st.accepted_links_count = 0
             st.pending_links = []
-            await msg.answer("""🔗 <b>Надішліть посилання</b> (можна кілька)
+            await msg.answer('\u2060' + """🔗 <b>Надішліть посилання</b> (можна кілька)
 
 Коли відправите <b>ВСІ</b> посилання -
 натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
@@ -2117,7 +2122,7 @@ async def flow(msg: Message):
 🧾 <code>{subject}</code>
 
 Після відправлення листа натисніть «✅ Готово»."""
-            await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
+            await msg.answer('\u2060' + text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2135,7 +2140,7 @@ async def flow(msg: Message):
                 return
             st.done_lock = True
             if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
-                await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
+                await msg.answer('\u2060' + 'Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -2144,7 +2149,7 @@ async def flow(msg: Message):
             return
         urls = extract_urls(msg.text or '')
         if not urls:
-            await msg.answer('Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
+            await msg.answer('\u2060' + 'Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
             return
         new_urls: List[str] = []
         for u in urls:
@@ -2173,7 +2178,7 @@ async def flow(msg: Message):
                 return
             st.done_lock = True
             if st.accepted_files_count <= 0 and not st.telegram_file_ids and not (get_cell(st.sheet_row, 'files_telegram_id') or '').strip():
-                await msg.answer('Поки що файлів не додано. Надішліть хоча б один файл або оберіть інший спосіб.', reply_markup=files_aux_kb())
+                await msg.answer('\u2060' + 'Поки що файлів не додано. Надішліть хоча б один файл або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -2235,7 +2240,7 @@ async def flow(msg: Message):
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
             return
-        await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
+        await msg.answer('\u2060' + 'Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
 
     # Якщо жодна з умов не спрацювала — користувач відійшов від сценарію
