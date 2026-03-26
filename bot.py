@@ -190,6 +190,15 @@ assert OAUTH_CLIENT_SECRETS_JSON and os.path.exists(OAUTH_CLIENT_SECRETS_JSON), 
 assert NOVAPOSHTA_API_KEY, 'NOVAPOSHTA_API_KEY is empty'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/view?usp=drive_link'
+DUE_DATE_TEXT = (
+    "Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):\n\n"
+    "<b>Строки виготовлення робіт</b>\n"
+    "Елайнери — до 3 робочих днів з моменту погодження\n"
+    "Сплінт друкований — 7 робочих днів\n"
+    "Сплінт фрезерований — 10 робочих днів\n"
+    "МР, Хайрекс — 10 робочих днів\n"
+    "Апарати на МІ — кожний етап до 10 робочих днів"
+)
 FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
 # The FILE_TAIL_TIMEOUT_SEC constant and related tail window logic have been removed.
 FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '15'))  # unused
@@ -1292,7 +1301,7 @@ def _prev_step(st: OrderState) -> tuple[str, str]:
     if dname == 'saved_pick':
         return ('np_menu', 'Доставити замовлення Новою Поштою. Оберіть пункт меню:')
     if sname == 'np_menu' or dname == 'recv_name' or dname:
-        return ('due_date', 'Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):')
+        return ('due_date', DUE_DATE_TEXT)
     if sname == 'due_date':
         return ('work_type', 'Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):')
     if sname == 'work_type':
@@ -1777,7 +1786,7 @@ async def flow(msg: Message):
                     'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()),
                     'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()),
                     'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()),
-                    'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()),
+                    'due_date': (DUE_DATE_TEXT, bottom_nav_kb()),
                     'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))),
                     'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()),
                     'await_tele_files': (
@@ -1983,7 +1992,7 @@ async def flow(msg: Message):
             return
         st.work_type = val
         if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
-        await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
+        await msg.answer(DUE_DATE_TEXT, reply_markup=bottom_nav_kb(), parse_mode='HTML')
         st.step = 'due_date'
         await save_bot_state_async(msg.chat.id, st)
         return
