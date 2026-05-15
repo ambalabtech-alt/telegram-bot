@@ -344,6 +344,22 @@ def headers_map(ws_) -> Dict[str, int]:
     return get_headers_map(ws_, cache_key)
 
 def set_cell(row: int, col_name: str, value):
+    """
+    Write a value into a single cell. Validates that the target row exists to avoid
+    unintentionally writing outside the bounds of the worksheet.
+    """
+    # Ensure we never write above the header row or beyond the current sheet size.
+    try:
+        # Access row_count on the worksheet. If it fails, allow original error to propagate.
+        max_rows = getattr(ws, "row_count", None)
+    except Exception:
+        max_rows = None
+
+    # If we know the maximum number of rows, guard against invalid row indexes.
+    if isinstance(row, int) and row and max_rows:
+        if row < 2 or row > max_rows:
+            raise RuntimeError(f"Invalid sheet row: {row}, max rows: {max_rows}")
+
     col = headers_map(ws).get(col_name)
     if not col:
         logger.warning('Sheets: column %r not found', col_name)
@@ -351,6 +367,20 @@ def set_cell(row: int, col_name: str, value):
     _retry_sheets(ws.update_cell, row, col, str(value))
 
 def get_cell(row: int, col_name: str) -> str:
+    """
+    Read a cell from the sheet. Ensures the requested row is valid before attempting
+    to access it. Returns an empty string if the column is not found.
+    """
+    # Validate the row number against current sheet size.
+    try:
+        max_rows = getattr(ws, "row_count", None)
+    except Exception:
+        max_rows = None
+
+    if isinstance(row, int) and row and max_rows:
+        if row < 2 or row > max_rows:
+            raise RuntimeError(f"Invalid sheet row: {row}, max rows: {max_rows}")
+
     col = headers_map(ws).get(col_name)
     if not col:
         return ''
@@ -397,14 +427,58 @@ def find_row_by_order_id(order_id: str) -> int:
         return 0
 
 def append_row(values: Dict[str, str]) -> int:
+    """
+    Append a new order row to the worksheet. Instead of relying on gspread's
+    append_row (which can behave unpredictably when the sheet has hidden or
+    filtered rows), this implementation computes the first truly empty row by
+    inspecting the order_id column and writes the full row in one update.
+    The function returns the row index of the newly inserted order. If the
+    order_id column is missing or the order cannot be located after insertion,
+    a RuntimeError is raised.
+    """
     head = headers_map(ws)
-    row_dict = {**{h: '' for h in head.keys()}, **values}
-    _retry_sheets(ws.append_row, [row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
-    # invalidate cache so the next lookup sees the newly appended order_id
+    # Determine the index of the order_id column.
+    order_col = head.get('order_id')
+    if not order_col:
+        raise RuntimeError("Column 'order_id' not found")
+
+    order_id = (values.get('order_id') or '').strip()
+    if not order_id:
+        raise RuntimeError("order_id is empty")
+
+    # Fetch existing order_id values to find the first empty row.
+    col_vals = _retry_sheets(ws.col_values, order_col)
+    # The header occupies row 1; values list starts from row 1 as well.
+    # len(col_vals) gives the number of used rows including header.
+    target_row = len(col_vals) + 1
+    if target_row < 2:
+        target_row = 2
+
+    # If we are about to write beyond the current sheet, expand it.
+    try:
+        max_rows = ws.row_count
+    except Exception:
+        max_rows = None
+    if max_rows and target_row > max_rows:
+        # Add a buffer of 200 rows to reduce frequent expansions.
+        extra = target_row - max_rows + 200
+        _retry_sheets(ws.add_rows, extra)
+
+    # Prepare the row values aligned with headers.
+    row_values = [values.get(h, '') for h in head.keys()]
+
+    # Write the row values starting at column A.
+    start_cell = f"A{target_row}"
+    _retry_sheets(ws.update, start_cell, [row_values], value_input_option='USER_ENTERED')
+
+    # Invalidate order_id cache to ensure the new order_id is visible.
     ORDER_ROW_CACHE["ts"] = 0.0
-    order_id = values.get('order_id')
-    row = find_row_by_order_id(order_id) if order_id else 0
-    return row if row else ws.row_count
+
+    # Verify that the row can be found by order_id after insertion.
+    inserted_row = find_row_by_order_id(order_id)
+    if not inserted_row:
+        raise RuntimeError(f"Order row not found after insert: {order_id}")
+    return inserted_row
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
