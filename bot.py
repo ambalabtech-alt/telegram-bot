@@ -22,7 +22,7 @@ DATE_RE = re.compile('^(\\d{1,2})\\.(\\d{1,2})(?:\\.(\\d{2,4}))?$')
 NP_POSTOMAT_REF = 'f9316480-5f2d-425d-bc2c-ac7cd29decf0'
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ContentType, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ContentType, ReplyKeyboardRemove, PollAnswer
 
 async def _show_np_menu(msg: Message) -> None:
     """Show NP menu with proper clearing and state."""
@@ -190,19 +190,17 @@ assert OAUTH_CLIENT_SECRETS_JSON and os.path.exists(OAUTH_CLIENT_SECRETS_JSON), 
 assert NOVAPOSHTA_API_KEY, 'NOVAPOSHTA_API_KEY is empty'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/view?usp=drive_link'
-DUE_DATE_TEXT = (
-    "Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):\n\n"
-    "<b>Строки виготовлення робіт</b>\n"
-    "Елайнери — до 3 робочих днів з моменту погодження\n"
-    "Сплінт друкований — 7 робочих днів\n"
-    "Сплінт фрезерований — 10 робочих днів\n"
-    "МР, Хайрекс — 10 робочих днів\n"
-    "Апарати на МІ — кожний етап до 10 робочих днів"
-)
 FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
 # The FILE_TAIL_TIMEOUT_SEC constant and related tail window logic have been removed.
 FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '15'))  # unused
 BOT_STATE_SHEET_NAME = os.getenv('BOT_STATE_SHEET_NAME', '_bot_state')
+
+# ---
+# Опитування: назви аркушів для журналу та відповідей.
+# Лист «Лог_опитувань» зберігає відправлені опитування (campaign_id, chat_id, phone, poll_id, message_id, options_json, status, details).
+# Лист «Відповіді_опитувань» зберігає вибори лікарів (timestamp, campaign_id, poll_id, chat_id, phone, answer_index, answer_text, username).
+POLL_LOG_SHEET_NAME = 'Лог_опитувань'
+POLL_RESPONSES_SHEET_NAME = 'Відповіді_опитувань'
 
 # -----------------------------------------------------------------------------
 # Wave upload configuration
@@ -344,22 +342,6 @@ def headers_map(ws_) -> Dict[str, int]:
     return get_headers_map(ws_, cache_key)
 
 def set_cell(row: int, col_name: str, value):
-    """
-    Write a value into a single cell. Validates that the target row exists to avoid
-    unintentionally writing outside the bounds of the worksheet.
-    """
-    # Ensure we never write above the header row or beyond the current sheet size.
-    try:
-        # Access row_count on the worksheet. If it fails, allow original error to propagate.
-        max_rows = getattr(ws, "row_count", None)
-    except Exception:
-        max_rows = None
-
-    # If we know the maximum number of rows, guard against invalid row indexes.
-    if isinstance(row, int) and row and max_rows:
-        if row < 2 or row > max_rows:
-            raise RuntimeError(f"Invalid sheet row: {row}, max rows: {max_rows}")
-
     col = headers_map(ws).get(col_name)
     if not col:
         logger.warning('Sheets: column %r not found', col_name)
@@ -367,20 +349,6 @@ def set_cell(row: int, col_name: str, value):
     _retry_sheets(ws.update_cell, row, col, str(value))
 
 def get_cell(row: int, col_name: str) -> str:
-    """
-    Read a cell from the sheet. Ensures the requested row is valid before attempting
-    to access it. Returns an empty string if the column is not found.
-    """
-    # Validate the row number against current sheet size.
-    try:
-        max_rows = getattr(ws, "row_count", None)
-    except Exception:
-        max_rows = None
-
-    if isinstance(row, int) and row and max_rows:
-        if row < 2 or row > max_rows:
-            raise RuntimeError(f"Invalid sheet row: {row}, max rows: {max_rows}")
-
     col = headers_map(ws).get(col_name)
     if not col:
         return ''
@@ -427,58 +395,14 @@ def find_row_by_order_id(order_id: str) -> int:
         return 0
 
 def append_row(values: Dict[str, str]) -> int:
-    """
-    Append a new order row to the worksheet. Instead of relying on gspread's
-    append_row (which can behave unpredictably when the sheet has hidden or
-    filtered rows), this implementation computes the first truly empty row by
-    inspecting the order_id column and writes the full row in one update.
-    The function returns the row index of the newly inserted order. If the
-    order_id column is missing or the order cannot be located after insertion,
-    a RuntimeError is raised.
-    """
     head = headers_map(ws)
-    # Determine the index of the order_id column.
-    order_col = head.get('order_id')
-    if not order_col:
-        raise RuntimeError("Column 'order_id' not found")
-
-    order_id = (values.get('order_id') or '').strip()
-    if not order_id:
-        raise RuntimeError("order_id is empty")
-
-    # Fetch existing order_id values to find the first empty row.
-    col_vals = _retry_sheets(ws.col_values, order_col)
-    # The header occupies row 1; values list starts from row 1 as well.
-    # len(col_vals) gives the number of used rows including header.
-    target_row = len(col_vals) + 1
-    if target_row < 2:
-        target_row = 2
-
-    # If we are about to write beyond the current sheet, expand it.
-    try:
-        max_rows = ws.row_count
-    except Exception:
-        max_rows = None
-    if max_rows and target_row > max_rows:
-        # Add a buffer of 200 rows to reduce frequent expansions.
-        extra = target_row - max_rows + 200
-        _retry_sheets(ws.add_rows, extra)
-
-    # Prepare the row values aligned with headers.
-    row_values = [values.get(h, '') for h in head.keys()]
-
-    # Write the row values starting at column A.
-    start_cell = f"A{target_row}"
-    _retry_sheets(ws.update, start_cell, [row_values], value_input_option='USER_ENTERED')
-
-    # Invalidate order_id cache to ensure the new order_id is visible.
+    row_dict = {**{h: '' for h in head.keys()}, **values}
+    _retry_sheets(ws.append_row, [row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+    # invalidate cache so the next lookup sees the newly appended order_id
     ORDER_ROW_CACHE["ts"] = 0.0
-
-    # Verify that the row can be found by order_id after insertion.
-    inserted_row = find_row_by_order_id(order_id)
-    if not inserted_row:
-        raise RuntimeError(f"Order row not found after insert: {order_id}")
-    return inserted_row
+    order_id = values.get('order_id')
+    row = find_row_by_order_id(order_id) if order_id else 0
+    return row if row else ws.row_count
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
@@ -1217,10 +1141,8 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     # Do not process if channel is not configured
     if not FILES_CHANNEL_ID:
         return False
-    # Whenever a new file arrives we consider the current wave incomplete and
-    # disable the Done button.  We no longer support a tail window for late
-    # uploads; once the user presses Done no further files are accepted.
-    if st.files_wave_closed:
+    # Once the step has been closed we no longer accept files for this upload method.
+    if st.step != 'await_tele_files':
         return False
     # Validate file size for documents
     if msg.content_type == ContentType.DOCUMENT:
@@ -1235,10 +1157,6 @@ async def handle_telegram_upload(msg: Message, st: 'OrderState', silent: bool = 
     if file_id not in st.telegram_file_ids:
         st.telegram_file_ids.append(file_id)
         st.accepted_files_count += 1
-        # A new unique file disables the Done button until the wave is acknowledged.
-        st.files_done_allowed = False
-    # We no longer update or watch waves for file uploads.  The user manually
-    # presses “✅ Готово” when all files have been sent and fully uploaded.
     # Prepare caption for channel posting
     caption = f"ID замовлення: {nz(st.order_id)}\nПацієнт: {st.patient_lastname or ''}"
     async def _post_file_best_effort(row_snapshot: int, order_id_snapshot: str):
@@ -1313,7 +1231,7 @@ def bottom_nav_kb() -> ReplyKeyboardMarkup:
 def files_aux_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='⬅️ Обрати інший спосіб'), KeyboardButton(text='✅ Готово')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=False, is_persistent=True)
 
-async def _refresh_done_keyboard(msg: Message, text: str = 'Можете надсилати ще або натисніть «✅ Готово».') -> None:
+async def _refresh_done_keyboard(msg: Message, text: str = 'Коли завершите, натисніть «✅ Готово».') -> None:
     """Force Telegram clients to reopen reply keyboard for note steps."""
     try:
         await msg.answer('‎', reply_markup=ReplyKeyboardRemove())
@@ -1375,7 +1293,7 @@ def _prev_step(st: OrderState) -> tuple[str, str]:
     if dname == 'saved_pick':
         return ('np_menu', 'Доставити замовлення Новою Поштою. Оберіть пункт меню:')
     if sname == 'np_menu' or dname == 'recv_name' or dname:
-        return ('due_date', DUE_DATE_TEXT)
+        return ('due_date', 'Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):')
     if sname == 'due_date':
         return ('work_type', 'Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):')
     if sname == 'work_type':
@@ -1712,10 +1630,7 @@ async def ask_notes(msg: Message, st: OrderState):
     # Reset the Done lock when entering the notes step so that the Done button
     # can be used again in this new context.
     st.done_lock = False
-    await msg.answer(
-        'Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ',
-        reply_markup=notes_yesno_kb()
-    )
+    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', reply_markup=notes_yesno_kb())
     st.step = 'await_notes_choice'
     await save_bot_state_async(msg.chat.id, st)
 
@@ -1860,24 +1775,23 @@ async def flow(msg: Message):
                     'doctor_phone': ('Вкажіть, будь ласка, <b>Ваш номер телефону</b> для звʼязку:', bottom_nav_kb()),
                     'patient_lastname': ('Вкажіть, будь ласка, прізвище пацієнта:', bottom_nav_kb()),
                     'work_type': ('Вкажіть, будь ласка, який апарат замовляєте (сплінт, елайнери тощо):', bottom_nav_kb()),
-                    'due_date': (DUE_DATE_TEXT, bottom_nav_kb()),
+                    'due_date': ('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', bottom_nav_kb()),
                     'np_menu': ('Доставити замовлення Новою Поштою. Оберіть пункт меню:', np_menu_kb(has_saved=bool(np_profiles_list(msg.chat.id)))),
                     'choose_files_method': ('Оберіть спосіб передачі файлів:', files_method_kb()),
                     'await_tele_files': (
-                        '📎 <b>Надішліть файли</b> (можна кілька)\n\n'
-                        'Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження\n'
-                        'і натисніть «✅ Готово».',
-                        files_aux_kb()
+                        '📎 <b>Надішліть файли</b> (можна кілька)\n\nКоли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження\nі натисніть «✅ Готово».',
+                        files_aux_kb(),
                     ),
                     'await_links': (
-                        '🔗 <b>Надішліть посилання</b> (можна кілька)\n\n'
-                        'Коли відправите <b>ВСІ</b> посилання —\n'
-                        'натисніть «✅ Готово».',
-                        files_aux_kb()
+                        '🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання -\nнатисніть «✅ Готово».',
+                        files_aux_kb(),
                     ),
-                    'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите — натисніть «✅ Готово».', done_kb()),
+                    'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите - натисніть «✅ Готово».', done_kb()),
                     'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', notes_yesno_kb()),
-                    'await_notes': ('💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».', done_kb())
+                    'await_notes': (
+                        '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».',
+                        done_kb(),
+                    ),
                 }
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
                 resp = await msg.answer(hint, reply_markup=kb, parse_mode='HTML')
@@ -1905,7 +1819,7 @@ async def flow(msg: Message):
         if choice == '✅ Готово':
             return
         if choice == 'Так':
-            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
+            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
             st.step = 'await_notes'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2066,7 +1980,7 @@ async def flow(msg: Message):
             return
         st.work_type = val
         if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
-        await msg.answer(DUE_DATE_TEXT, reply_markup=bottom_nav_kb(), parse_mode='HTML')
+        await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
         await save_bot_state_async(msg.chat.id, st)
         return
@@ -2178,26 +2092,22 @@ async def flow(msg: Message):
         t = msg.text or ''
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
-            # Initialize counters for the Telegram upload step (do not start wave logic).
             st.accepted_files_count = 0
-            # Prompt the user to send files and to press Done manually after fully uploading them.
-            await msg.answer(
-                '📎 <b>Надішліть файли</b> (можна кілька)\n\n'
-                'Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження\n'
-                'і натисніть «✅ Готово».',
-                reply_markup=files_aux_kb(),
-                parse_mode='HTML'
-            )
+            await msg.answer("""📎 <b>Надішліть файли</b> (можна кілька)
+
+Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження
+і натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_tele_files'
             await save_bot_state_async(msg.chat.id, st)
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
-            # Reset link wave state and counters
-            reset_links_wave(st)
             st.accepted_links_count = 0
             st.pending_links = []
-            await msg.answer('🔗 <b>Надішліть посилання</b> (можна кілька)\n\nКоли відправите <b>ВСІ</b> посилання —\nнатисніть «✅ Готово».', reply_markup=files_aux_kb(), parse_mode='HTML')
+            await msg.answer("""🔗 <b>Надішліть посилання</b> (можна кілька)
+
+Коли відправите <b>ВСІ</b> посилання -
+натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
             st.step = 'await_links'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2207,7 +2117,13 @@ async def flow(msg: Message):
                 set_cell(st.sheet_row, 'email', LAB_EMAIL)
             lastname = getattr(st, 'patient_lastname', '') or ''
             subject = f'AmbaLab order {nz(st.order_id)} - {lastname}' if lastname else f'AmbaLab order {nz(st.order_id)}'
-            text = f'Скопіюйте електронну адресу і тему листа\n\n📧 <code>{LAB_EMAIL}</code>\n\n🧾 <code>{subject}</code>\n\nПісля відправлення листа натисніть «✅ Готово».'
+            text = f"""Скопіюйте електронну адресу і тему листа
+
+📧 <code>{LAB_EMAIL}</code>
+
+🧾 <code>{subject}</code>
+
+Після відправлення листа натисніть «✅ Готово»."""
             await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
             await save_bot_state_async(msg.chat.id, st)
@@ -2222,45 +2138,27 @@ async def flow(msg: Message):
         return
     if st.step == 'await_links':
         if (msg.text or '').strip() == '✅ Готово':
-            # Do not allow completion if the current link wave has not yet been acknowledged.
-            if not st.links_done_allowed:
-                await msg.answer('Зачекайте, поки всі посилання будуть завантажені та збережені.', reply_markup=files_aux_kb())
-                return
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
-            # If no links were accepted, ask the user to provide at least one
             if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
-            # Close the current wave and update Sheets
-            close_links_wave(st)
             set_cell(st.sheet_row, 'status', 'files_expected')
             await ask_notes(msg, st)
-            # Release the lock for subsequent steps
             st.done_lock = False
             return
         urls = extract_urls(msg.text or '')
-        # If no URLs are detected, prompt the user to send a valid link
         if not urls:
             await msg.answer('Не бачу посилань. Надішліть URL, потім натисніть ✅ Готово.', reply_markup=files_aux_kb())
             return
-        # Collect new URLs (deduplicated within this session)
         new_urls: List[str] = []
         for u in urls:
             if u not in st.pending_links:
                 st.pending_links.append(u)
                 st.accepted_links_count += 1
                 new_urls.append(u)
-        # Update wave state and ensure watcher
-        if new_urls:
-            # Any new link disables the Done button until the wave is acknowledged.
-            st.links_done_allowed = False
-            touch_links_wave(st, len(new_urls))
-            ensure_links_wave_task(msg, st)
-        # Save links to Sheets in the background
         async def _save_links_best_effort(urls_to_save: List[str], row_snapshot: int, order_id_snapshot: str):
             try:
                 if urls_to_save:
@@ -2278,20 +2176,16 @@ async def flow(msg: Message):
         return
     if st.step == 'await_tele_files':
         if (msg.text or '').strip() == '✅ Готово':
-            # Prevent double triggering of the Done action.
             if st.done_lock:
                 return
             st.done_lock = True
-            # If no files were accepted, ask the user to provide at least one or choose another method.
             if st.accepted_files_count <= 0 and not st.telegram_file_ids and not (get_cell(st.sheet_row, 'files_telegram_id') or '').strip():
                 await msg.answer('Поки що файлів не додано. Надішліть хоча б один файл або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
-            # Update status and proceed to the notes step.  Wave logic is no longer used.
             set_cell(st.sheet_row, 'status', 'files_expected')
             await save_bot_state_async(msg.chat.id, st)
             await ask_notes(msg, st)
-            # Release the lock for subsequent steps
             st.done_lock = False
             return
     if st.step == 'email_wait_done':
@@ -2309,7 +2203,6 @@ async def flow(msg: Message):
         return
     if st.step == 'await_notes':
         if (msg.text or '').strip() == '✅ Готово':
-            # When the user is done with notes, finalize the order.
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
@@ -2337,11 +2230,6 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            # After saving the voice note inform the user they may continue or finish.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -2353,11 +2241,6 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            # Inform the user after each note.
-            try:
-                await msg.answer('Можна докинути ще або натиснути «✅ Готово».', reply_markup=done_kb())
-            except Exception:
-                pass
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
@@ -2391,7 +2274,7 @@ def np_detect_kind(s: str):
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
     st = state_by_chat.get(q.message.chat.id)
-    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите —\nнатисніть «✅ Готово».')
+    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
     st.step = 'await_notes'
     await save_bot_state_async(q.message.chat.id, st)
     await q.answer()
@@ -2783,6 +2666,116 @@ async def _midnight_scheduler():
 # ====== /Auto-cancel ======
         
 # ==== End helpers ====
+
+# ==== Опитування через Telegram poll ====
+# Блок нижче реалізує журнал опитувань та обробку відповідей
+# на неанонімні Telegram poll. Функції використовують вже існуючі
+# змінні (sh, _retry_sheets, now_kyiv, doctor_phone_get) для роботи
+# з Google Sheets.
+
+def poll_log_ws():
+    """Повертає аркуш журналу відправлених опитувань."""
+    return sh.worksheet(POLL_LOG_SHEET_NAME)
+
+def poll_responses_ws():
+    """Повертає аркуш з відповідями на опитування."""
+    return sh.worksheet(POLL_RESPONSES_SHEET_NAME)
+
+def find_poll_log_by_poll_id(poll_id: str) -> dict:
+    """
+    Шукає запис про опитування за poll_id у журналі.
+    Повертає campaign_id, chat_id, phone та список варіантів (options).
+    """
+    try:
+        ws_poll_log = poll_log_ws()
+        rows = _retry_sheets(ws_poll_log.get_all_records)
+        for row in rows:
+            if str(row.get('poll_id', '')).strip() == str(poll_id).strip():
+                options_raw = row.get('options_json', '[]')
+                try:
+                    options = json.loads(options_raw)
+                except Exception:
+                    options = []
+                return {
+                    'campaign_id': str(row.get('campaign_id', '')).strip(),
+                    'chat_id': str(row.get('chat_id', '')).strip(),
+                    'phone': str(row.get('phone', '')).strip(),
+                    'options': options,
+                }
+    except Exception:
+        logger.exception('Poll: failed to find poll log by poll_id=%s', poll_id)
+    return {}
+
+def upsert_poll_response(row: list) -> None:
+    """
+    Додає або оновлює відповідь у аркуші Відповіді_опитувань.
+    Одна пара (poll_id, chat_id) — одна актуальна відповідь.
+    """
+    ws_resp = poll_responses_ws()
+    poll_id = str(row[2])
+    chat_id = str(row[3])
+    # Читаємо всі значення для пошуку існуючого рядка
+    values = _retry_sheets(ws_resp.get_all_values)
+    if len(values) > 1:
+        for idx, existing in enumerate(values[1:], start=2):
+            existing_poll_id = existing[2] if len(existing) > 2 else ''
+            existing_chat_id = existing[3] if len(existing) > 3 else ''
+            if str(existing_poll_id) == poll_id and str(existing_chat_id) == chat_id:
+                _retry_sheets(
+                    ws_resp.update,
+                    f'A{idx}:H{idx}',
+                    [row],
+                    value_input_option='USER_ENTERED'
+                )
+                return
+    _retry_sheets(
+        ws_resp.append_row,
+        row,
+        value_input_option='USER_ENTERED'
+    )
+
+@dp.poll_answer()
+async def handle_poll_answer(poll_answer: PollAnswer):
+    """
+    Обробляє відповіді на Telegram poll. Записує (timestamp, campaign_id, poll_id,
+    chat_id, phone, answer_index, answer_text, username) у таблицю.
+    """
+    try:
+        poll_id = str(poll_answer.poll_id)
+        user = poll_answer.user
+        chat_id = str(user.id) if user else ''
+        if not poll_id or not chat_id:
+            return
+        # Знаходимо журнал для цього poll_id
+        log_data = await asyncio.to_thread(find_poll_log_by_poll_id, poll_id)
+        if not log_data:
+            logger.warning('Poll: unknown poll_id=%s from chat_id=%s', poll_id, chat_id)
+            return
+        option_ids = list(poll_answer.option_ids or [])
+        if not option_ids:
+            answer_index = ''
+            answer_text = ''
+        else:
+            answer_index = option_ids[0]
+            options = log_data.get('options', [])
+            # На випадок, якщо індекс виходить за межі
+            answer_text = options[answer_index] if answer_index < len(options) else str(answer_index)
+        phone = log_data.get('phone') or doctor_phone_get(chat_id)
+        username = getattr(user, 'username', '') or ''
+        row = [
+            now_kyiv().strftime('%Y-%m-%d %H:%M:%S'),
+            log_data.get('campaign_id', ''),
+            poll_id,
+            chat_id,
+            phone,
+            answer_index,
+            answer_text,
+            username
+        ]
+        await asyncio.to_thread(upsert_poll_response, row)
+    except Exception:
+        logger.exception('Poll: handle_poll_answer failed')
+
 
 async def main():
     logger.info('Starting AmbaLab Bot...')
