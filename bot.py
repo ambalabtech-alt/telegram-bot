@@ -397,12 +397,22 @@ def find_row_by_order_id(order_id: str) -> int:
 def append_row(values: Dict[str, str]) -> int:
     head = headers_map(ws)
     row_dict = {**{h: '' for h in head.keys()}, **values}
-    _retry_sheets(ws.append_row, [row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+    # Append row strictly within columns A to AE to avoid unintended new column creation.
+    _retry_sheets(
+        ws.append_row,
+        [row_dict.get(h, '') for h in head.keys()],
+        value_input_option='USER_ENTERED',
+        table_range='A:AE'
+    )
     # invalidate cache so the next lookup sees the newly appended order_id
     ORDER_ROW_CACHE["ts"] = 0.0
     order_id = values.get('order_id')
     row = find_row_by_order_id(order_id) if order_id else 0
-    return row if row else ws.row_count
+    # Do not fall back to ws.row_count when the order_id cannot be located; raising an exception
+    # forces the caller to handle the error and prevents phantom row numbers.
+    if not row:
+        raise RuntimeError(f"append_row: failed to locate created row for order_id={order_id!r}")
+    return row
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
@@ -2028,15 +2038,17 @@ async def flow(msg: Message):
             if len(profiles) == 1:
                 p = profiles[0]
                 phone_val = normalize_ua_phone(p.get('recipient_phone', '')) or p.get('recipient_phone', '')
-                set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''))
-                set_cell(st.sheet_row, 'recipient_phone', phone_val)
-                set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''))
-                set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''))
+                # Safely write saved delivery details into the order row. Use _safe_set_cell to ensure
+                # the row belongs to this order and to queue the write if the row isn't yet available.
+                if not await _safe_set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''), msg): return
+                if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, msg): return
+                if not await _safe_set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''), msg): return
+                if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''), msg): return
                 if p.get('np_city_ref'):
-                    set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'])
+                    if not await _safe_set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'], msg): return
                     st.np_city_ref = p['np_city_ref']
                 if p.get('np_warehouse_ref'):
-                    set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'])
+                    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], msg): return
                 try:
                     np_profile_upsert(msg.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
                 except Exception:
@@ -2315,15 +2327,17 @@ async def np_use_saved_cb(q: CallbackQuery):
     if len(profiles) == 1:
         p = profiles[0]
         phone_val = normalize_ua_phone(p.get('recipient_phone', '')) or p.get('recipient_phone', '')
-        set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''))
-        set_cell(st.sheet_row, 'recipient_phone', phone_val)
-        set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''))
-        set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''))
+        # Safely write saved delivery details into the order row.  Use _safe_set_cell to verify the row
+        # and queue the write if necessary.
+        if not await _safe_set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''), q.message): return await q.answer()
         if p.get('np_city_ref'):
-            set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'])
+            if not await _safe_set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'], q.message): return await q.answer()
             st.np_city_ref = p['np_city_ref']
         if p.get('np_warehouse_ref'):
-            set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'])
+            if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], q.message): return await q.answer()
         try:
             np_profile_upsert(q.message.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
         except Exception:
@@ -2381,15 +2395,16 @@ async def np_pick_cb(q: CallbackQuery):
         c = head.get(k)
         return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
     phone_val = normalize_ua_phone(v('recipient_phone')) or v('recipient_phone')
-    set_cell(st.sheet_row, 'recipient_name', v('recipient_name'))
-    set_cell(st.sheet_row, 'recipient_phone', phone_val)
-    set_cell(st.sheet_row, 'np_city_name', v('np_city_name'))
-    set_cell(st.sheet_row, 'np_warehouse_desc', v('np_warehouse_desc'))
+    # Safely apply the picked NP profile values into the order row.
+    if not await _safe_set_cell(st.sheet_row, 'recipient_name', v('recipient_name'), q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'np_city_name', v('np_city_name'), q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', v('np_warehouse_desc'), q.message): return await q.answer()
     if head.get('np_city_ref'):
-        set_cell(st.sheet_row, 'np_city_ref', v('np_city_ref'))
+        if not await _safe_set_cell(st.sheet_row, 'np_city_ref', v('np_city_ref'), q.message): return await q.answer()
         st.np_city_ref = v('np_city_ref')
     if head.get('np_warehouse_ref'):
-        set_cell(st.sheet_row, 'np_warehouse_ref', v('np_warehouse_ref'))
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', v('np_warehouse_ref'), q.message): return await q.answer()
     await q.message.answer('Дані доставки підставлено.')
     await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
     st.delivery_step = ''
@@ -2405,14 +2420,17 @@ async def np_city_pick_cb(q: CallbackQuery):
         await q.answer()
         return
     st.np_city_ref = ref
-    set_cell(st.sheet_row, 'np_city_ref', ref)
+    # Safely record the chosen city Ref
+    if not await _safe_set_cell(st.sheet_row, 'np_city_ref', ref, q.message):
+        return await q.answer()
     city_name = ''
     for c in getattr(st, 'last_np_cities', []) or []:
         if c.get('Ref') == ref:
             city_name = c.get('Description', '') or c.get('DescriptionRu', '')
             break
     if city_name:
-        set_cell(st.sheet_row, 'np_city_name', city_name)
+        if not await _safe_set_cell(st.sheet_row, 'np_city_name', city_name, q.message):
+            return await q.answer()
     st.delivery_step = ''
     st.step = 'await_np_number'
     await q.message.answer('Введіть номер відділення або поштомату (наприклад: 15 або 2345).')
@@ -2427,12 +2445,16 @@ async def np_wh_pick_cb(q: CallbackQuery):
         if w.get('Ref') == ref:
             picked = w
             break
-    set_cell(st.sheet_row, 'np_warehouse_ref', ref)
+    # Safely record the chosen warehouse ref
+    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', ref, q.message):
+        return await q.answer()
     np_save_current_delivery(q.message.chat.id, st)
     if picked:
-        set_cell(st.sheet_row, 'np_warehouse_desc', picked.get('Description', ''))
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', picked.get('Description', ''), q.message):
+            return await q.answer()
         if picked.get('CityDescription'):
-            set_cell(st.sheet_row, 'np_city_name', picked.get('CityDescription'))
+            if not await _safe_set_cell(st.sheet_row, 'np_city_name', picked.get('CityDescription'), q.message):
+                return await q.answer()
     st.delivery_step = ''
     st.step = 'choose_files_method'
     await q.message.answer('Адресу доставки збережено.')
