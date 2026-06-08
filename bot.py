@@ -395,24 +395,56 @@ def find_row_by_order_id(order_id: str) -> int:
         return 0
 
 def append_row(values: Dict[str, str]) -> int:
+    """Create a new order row strictly in columns A:AE.
+
+    IMPORTANT:
+    Google Sheets append_row can mis-detect the "table" when there are hidden/empty
+    columns inside the visible structure and may append values to the right side
+    of the sheet. To avoid that completely, we calculate the next row from the
+    order_id column and update the exact A{row}:AE{row} range.
+    """
     head = headers_map(ws)
-    row_dict = {**{h: '' for h in head.keys()}, **values}
-    # Append row strictly within columns A to AE to avoid unintended new column creation.
+
+    # Use the existing header order, but write only the real order table width: A:AE.
+    # This keeps the row aligned from column A and prevents sideways appends.
+    ordered_headers = list(head.keys())[:31]  # A:AE = 31 columns
+    row_dict = {**{h: '' for h in ordered_headers}, **values}
+    row_values = [row_dict.get(h, '') for h in ordered_headers]
+
+    order_id = str(values.get('order_id') or '').strip()
+    if not order_id:
+        raise RuntimeError("append_row: order_id is required")
+
+    order_col = head.get('order_id')
+    if not order_col:
+        raise RuntimeError("append_row: column 'order_id' not found")
+
+    # Find the next row by the actual order_id column, not by ws.row_count and not by append_row.
+    existing_order_ids = _retry_sheets(ws.col_values, order_col)
+    next_row = max(len(existing_order_ids) + 1, 2)
+
+    # If the physical grid is shorter than the target row, extend rows, not columns.
+    if next_row > ws.row_count:
+        _retry_sheets(ws.add_rows, next_row - ws.row_count)
+
+    # Write the full row explicitly from A to AE.
     _retry_sheets(
-        ws.append_row,
-        [row_dict.get(h, '') for h in head.keys()],
-        value_input_option='USER_ENTERED',
-        table_range='A:AE'
+        ws.update,
+        f'A{next_row}:AE{next_row}',
+        [row_values],
+        value_input_option='USER_ENTERED'
     )
-    # invalidate cache so the next lookup sees the newly appended order_id
+
+    # Invalidate and refresh cache, then verify that the row really contains our order_id.
     ORDER_ROW_CACHE["ts"] = 0.0
-    order_id = values.get('order_id')
-    row = find_row_by_order_id(order_id) if order_id else 0
-    # Do not fall back to ws.row_count when the order_id cannot be located; raising an exception
-    # forces the caller to handle the error and prevents phantom row numbers.
-    if not row:
-        raise RuntimeError(f"append_row: failed to locate created row for order_id={order_id!r}")
-    return row
+    row = find_row_by_order_id(order_id)
+    if row != next_row:
+        raise RuntimeError(
+            f"append_row: verification failed for order_id={order_id!r}, "
+            f"expected_row={next_row}, found_row={row}"
+        )
+
+    return next_row
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
