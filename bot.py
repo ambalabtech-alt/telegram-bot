@@ -1,7 +1,7 @@
 import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
-import os, io, asyncio, logging, re
+import os, io, asyncio, logging, re, threading
 URL_RE = re.compile('(?i)\\b((?:https?|ftp)://[^\\s<>]+|www\\.[^\\s<>]+|[a-z0-9.-]+\\.[a-z]{2,}[^\\s<>]*)')
 
 def extract_urls(text: str):
@@ -265,6 +265,9 @@ gc, sh, ws, drive = get_google_clients()
 # --- Sheets order_id -> row cache (to speed up exact row lookup) ---
 ORDER_ROW_CACHE = {"ts": 0.0, "map": {}}
 ORDER_ROW_CACHE_TTL = 60  # seconds
+APPEND_ROW_LOCK = threading.Lock()
+ORDER_TABLE_RANGE = 'A:AE'
+ORDER_TABLE_WIDTH = 31
 
 def append_files_method(row: int, method_key: str):
     """Append unique method keys to the existing 'files_method' column, comma-separated."""
@@ -397,17 +400,14 @@ def find_row_by_order_id(order_id: str) -> int:
 def append_row(values: Dict[str, str]) -> int:
     """Create a new order row strictly in columns A:AE.
 
-    IMPORTANT:
-    Google Sheets append_row can mis-detect the "table" when there are hidden/empty
-    columns inside the visible structure and may append values to the right side
-    of the sheet. To avoid that completely, we calculate the next row from the
-    order_id column and update the exact A{row}:AE{row} range.
+    This deliberately does NOT use Google Sheets append_row.  Google can mis-detect
+    the table when there are hidden/empty columns and append values to the right.
+    Here we find the next row by the actual content inside A:AE and write exactly
+    to A{row}:AE{row}.
     """
     head = headers_map(ws)
 
-    # Use the existing header order, but write only the real order table width: A:AE.
-    # This keeps the row aligned from column A and prevents sideways appends.
-    ordered_headers = list(head.keys())[:31]  # A:AE = 31 columns
+    ordered_headers = list(head.keys())[:ORDER_TABLE_WIDTH]  # A:AE = 31 columns
     row_dict = {**{h: '' for h in ordered_headers}, **values}
     row_values = [row_dict.get(h, '') for h in ordered_headers]
 
@@ -419,32 +419,49 @@ def append_row(values: Dict[str, str]) -> int:
     if not order_col:
         raise RuntimeError("append_row: column 'order_id' not found")
 
-    # Find the next row by the actual order_id column, not by ws.row_count and not by append_row.
-    existing_order_ids = _retry_sheets(ws.col_values, order_col)
-    next_row = max(len(existing_order_ids) + 1, 2)
+    # Serialize row creation.  Without this, two simultaneous orders may both
+    # calculate the same next_row and overwrite each other.
+    with APPEND_ROW_LOCK:
+        table_values = _retry_sheets(ws.get, ORDER_TABLE_RANGE)
 
-    # If the physical grid is shorter than the target row, extend rows, not columns.
-    if next_row > ws.row_count:
-        _retry_sheets(ws.add_rows, next_row - ws.row_count)
+        last_used_row = 1  # row 1 is headers
+        for idx, row_vals in enumerate(table_values, start=1):
+            if idx == 1:
+                continue
+            if any(str(v or '').strip() for v in row_vals):
+                last_used_row = idx
 
-    # Write the full row explicitly from A to AE.
-    _retry_sheets(
-        ws.update,
-        f'A{next_row}:AE{next_row}',
-        [row_values],
-        value_input_option='USER_ENTERED'
-    )
+        next_row = max(last_used_row + 1, 2)
 
-    # Invalidate and refresh cache, then verify that the row really contains our order_id.
-    ORDER_ROW_CACHE["ts"] = 0.0
-    row = find_row_by_order_id(order_id)
-    if row != next_row:
-        raise RuntimeError(
-            f"append_row: verification failed for order_id={order_id!r}, "
-            f"expected_row={next_row}, found_row={row}"
+        # If the physical grid is shorter than the target row, extend rows only.
+        if next_row > ws.row_count:
+            _retry_sheets(ws.add_rows, next_row - ws.row_count)
+
+        # Write the full row explicitly from column A to AE.
+        _retry_sheets(
+            ws.update,
+            f'A{next_row}:AE{next_row}',
+            [row_values],
+            value_input_option='USER_ENTERED'
         )
 
-    return next_row
+        # Verify by reading the exact cell we just wrote, not by scanning/cache.
+        written_order_id = ''
+        for _ in range(3):
+            written_order_id = str((_retry_sheets(ws.cell, next_row, order_col).value) or '').strip()
+            if written_order_id == order_id:
+                break
+            time.sleep(0.5)
+
+        if written_order_id != order_id:
+            raise RuntimeError(
+                f"append_row: verification failed for order_id={order_id!r}, "
+                f"row={next_row}, cell_value={written_order_id!r}"
+            )
+
+        ORDER_ROW_CACHE["ts"] = 0.0
+        return next_row
+
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
@@ -1532,12 +1549,20 @@ def nz(v):
     return v if v not in (None, '', 'None') else '—'
 
 def build_summary_text(st: OrderState) -> str:
-    v = lambda name: get_cell(st.sheet_row, name)
+    """Build final order summary with one row read instead of many cell reads."""
+    row = getattr(st, 'sheet_row', 0) or find_row_by_order_id(getattr(st, 'order_id', ''))
+    if row:
+        st.sheet_row = row
 
-    # сирий вміст комірки
+    head = headers_map(ws)
+    row_vals = _retry_sheets(ws.row_values, row) if row else []
+
+    def v(name: str) -> str:
+        c = head.get(name)
+        return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
+
     fm_raw = (v('files_method') or '').strip()
 
-    # мапа для "людських" назв
     files_map = {
         'telegram_upload': 'Завантаження у бот',
         'link': 'Посилання',
@@ -1545,7 +1570,6 @@ def build_summary_text(st: OrderState) -> str:
         'Imprint': 'Відбитки',
     }
 
-    # підтримка кількох методів через кому, але без зміни старої поведінки
     if ',' in fm_raw:
         parts = [p.strip() for p in fm_raw.split(',') if p.strip()]
         human_parts = [files_map.get(p, p) for p in parts]
@@ -1567,7 +1591,6 @@ def build_summary_text(st: OrderState) -> str:
         f"Технік звʼяжеться з Вами найближчим часом."
     )
 
-    # 2. Додатковий блок ТІЛЬКИ якщо серед методів є Imprint
     has_imprint = any(
         p.strip() == 'Imprint'
         for p in (fm_raw.split(',') if fm_raw else [])
@@ -1679,15 +1702,23 @@ async def ask_notes(msg: Message, st: OrderState):
 async def finalize_order(msg: Message, st: OrderState):
     if getattr(st, 'finalized', False):
         return
-    # Batch acknowledgement invalidation removed
     st.finalized = True
+
     try:
-        if getattr(st, 'sheet_row', 0):
-            set_cell(st.sheet_row, 'status', 'order_submitted')
+        row = getattr(st, 'sheet_row', 0) or await asyncio.to_thread(find_row_by_order_id, getattr(st, 'order_id', ''))
+        if row:
+            st.sheet_row = row
+            await asyncio.to_thread(set_cell, row, 'status', 'order_submitted')
     except Exception:
         logger.exception('Failed to set final status')
 
-    await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
+    try:
+        summary_text = await asyncio.to_thread(build_summary_text, st)
+    except Exception:
+        logger.exception('Failed to build summary text')
+        summary_text = f"Ваше замовлення № <b>{nz(st.order_id)}</b> прийнято. Технік звʼяжеться з Вами найближчим часом."
+
+    await msg.answer(summary_text, parse_mode='HTML', reply_markup=main_kb())
     state_by_chat[msg.chat.id] = OrderState()
     await delete_bot_state_async(msg.chat.id)
 
@@ -2081,10 +2112,7 @@ async def flow(msg: Message):
                     st.np_city_ref = p['np_city_ref']
                 if p.get('np_warehouse_ref'):
                     if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], msg): return
-                try:
-                    np_profile_upsert(msg.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
-                except Exception:
-                    pass
+                # Saved profile is already stored in Лист2, no need to re-save it here.
                 await msg.answer('Дані доставки підставлено.')
                 await _clear_inline_markup(msg)
                 await _clear_inline_markup(msg)
@@ -2370,15 +2398,12 @@ async def np_use_saved_cb(q: CallbackQuery):
             st.np_city_ref = p['np_city_ref']
         if p.get('np_warehouse_ref'):
             if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], q.message): return await q.answer()
-        try:
-            np_profile_upsert(q.message.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
-        except Exception:
-            pass
+        # Saved profile is already stored in Лист2, no need to re-save it here.
         await q.message.answer('Дані доставки підставлено.')
         await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         st.delivery_step = ''
         st.step = 'choose_files_method'
-        await save_bot_state_async(msg.chat.id, st)
+        await save_bot_state_async(q.message.chat.id, st)
         return await q.answer()
     rows = []
     for pr in profiles[:20]:
