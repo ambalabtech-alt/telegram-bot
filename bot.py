@@ -1,7 +1,7 @@
 import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
-import os, io, asyncio, logging, re, threading
+import os, io, asyncio, logging, re
 URL_RE = re.compile('(?i)\\b((?:https?|ftp)://[^\\s<>]+|www\\.[^\\s<>]+|[a-z0-9.-]+\\.[a-z]{2,}[^\\s<>]*)')
 
 def extract_urls(text: str):
@@ -265,9 +265,6 @@ gc, sh, ws, drive = get_google_clients()
 # --- Sheets order_id -> row cache (to speed up exact row lookup) ---
 ORDER_ROW_CACHE = {"ts": 0.0, "map": {}}
 ORDER_ROW_CACHE_TTL = 60  # seconds
-APPEND_ROW_LOCK = threading.Lock()
-NP_PROFILES_CACHE: Dict[str, List[dict]] = {}
-
 
 def append_files_method(row: int, method_key: str):
     """Append unique method keys to the existing 'files_method' column, comma-separated."""
@@ -294,53 +291,40 @@ DOCTOR_PHONE_CACHE: Dict[str, str] = {}
 
 def warmup_doctor_phone_cache() -> None:
     """
-    Populate fast in-memory caches from Лист2:
-    - DOCTOR_PHONE_CACHE: chat_id -> phone
-    - NP_PROFILES_CACHE: chat_id -> list of saved delivery profiles
+    Populate DOCTOR_PHONE_CACHE with all chat_id → phone mappings from Лист2.
 
-    This is one read of Лист2 at startup, so order flow does not repeatedly
-    scan Google Sheets when the doctor chooses a saved NP address.
+    This function performs a single read of the NP profiles worksheet to
+    reconstruct the entire mapping.  It should be called once when the bot
+    starts (for example in `_main()`) to avoid repeated expensive scans of
+    Google Sheets on every order.  On any error, the cache is left empty.
     """
-    global DOCTOR_PHONE_CACHE, NP_PROFILES_CACHE
+    global DOCTOR_PHONE_CACHE
     try:
         ws2 = np_profiles_ws()
         head = np_head(ws2)
-        rows = _retry_sheets(ws2.get_all_values)
-        phone_cache: Dict[str, str] = {}
-        profiles_cache: Dict[str, List[dict]] = {}
-
-        def val(row_vals, key: str) -> str:
-            c = head.get(key)
-            return row_vals[c - 1].strip() if c and c - 1 < len(row_vals) else ''
-
-        for row_num, row_vals in enumerate(rows[1:], start=2):
-            cid = val(row_vals, 'chat_id')
+        chat_col = head.get('chat_id')
+        phone_col = head.get('phone')
+        if not (chat_col and phone_col):
+            DOCTOR_PHONE_CACHE = {}
+            return
+        # Read chat_id and phone columns.  If phone column is shorter, missing
+        # entries default to empty string.
+        chat_vals = ws2.col_values(chat_col)
+        phone_vals = ws2.col_values(phone_col)
+        cache: Dict[str, str] = {}
+        for i, chat_id_val in enumerate(chat_vals):
+            cid = str(chat_id_val or '').strip()
             if not cid:
                 continue
-            phone = val(row_vals, 'phone')
-            if phone and cid not in phone_cache:
-                phone_cache[cid] = phone
-
-            profile = {
-                '_row': row_num,
-                'recipient_name': val(row_vals, 'recipient_name'),
-                'recipient_phone': val(row_vals, 'recipient_phone'),
-                'np_city_name': val(row_vals, 'np_city_name'),
-                'np_city_ref': val(row_vals, 'np_city_ref'),
-                'np_warehouse_desc': val(row_vals, 'np_warehouse_desc'),
-                'np_warehouse_ref': val(row_vals, 'np_warehouse_ref'),
-            }
-            # Treat as a delivery profile only when it has meaningful delivery data.
-            if any(profile.get(k) for k in ('recipient_name', 'recipient_phone', 'np_city_name', 'np_warehouse_desc', 'np_city_ref', 'np_warehouse_ref')):
-                profiles_cache.setdefault(cid, []).append(profile)
-
-        DOCTOR_PHONE_CACHE = phone_cache
-        NP_PROFILES_CACHE = profiles_cache
-        logger.info('Warmup caches done: phones=%s, np_profiles=%s', len(DOCTOR_PHONE_CACHE), sum(len(v) for v in NP_PROFILES_CACHE.values()))
+            ph_val = phone_vals[i] if i < len(phone_vals) else ''
+            ph = str(ph_val or '').strip()
+            if ph:
+                cache[cid] = ph
+        DOCTOR_PHONE_CACHE = cache
     except Exception as e:
-        logger.exception("Failed to warmup doctor/NP caches: %s", e)
+        logger.exception("Failed to warmup doctor phone cache: %s", e)
         DOCTOR_PHONE_CACHE = {}
-        NP_PROFILES_CACHE = {}
+
 
 def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
     if force or cache_key not in HEADERS_CACHE:
@@ -410,119 +394,25 @@ def find_row_by_order_id(order_id: str) -> int:
         logger.exception("Sheets: find_row_by_order_id failed")
         return 0
 
-def col_to_a1(col: int) -> str:
-    """Convert 1-based column number to A1 column letters."""
-    s = ''
-    while col:
-        col, rem = divmod(col - 1, 26)
-        s = chr(65 + rem) + s
-    return s
-
-
-def _row_is_empty_a_to_ae(row_vals: List[str]) -> bool:
-    return not any(str(v or '').strip() for v in row_vals[:31])
-
-
-def first_free_order_row() -> int:
-    """Return the first fully empty row in the real order table A:AE.
-
-    We scan A:AE, not only the order_id column, so manual rows without order_id
-    are not treated as free and will never be overwritten.
-    """
-    rows = _retry_sheets(ws.get, 'A:AE')
-    for idx, row_vals in enumerate(rows[1:], start=2):
-        if _row_is_empty_a_to_ae(row_vals):
-            return idx
-    return max(len(rows) + 1, 2)
-
-
-def update_row_values_a_to_ae(row: int, values: Dict[str, str]) -> None:
-    """Write one order row explicitly from column A to AE."""
-    headers = _retry_sheets(ws.row_values, 1)
-    if len(headers) < 31:
-        headers = headers + [''] * (31 - len(headers))
-    ordered_headers = headers[:31]
-    row_values = [str(values.get(h, '') if h else '') for h in ordered_headers]
-    if row > ws.row_count:
-        _retry_sheets(ws.add_rows, row - ws.row_count)
-    _retry_sheets(ws.update, f'A{row}:AE{row}', [row_values], value_input_option='USER_ENTERED')
-
-
-def update_cells_by_names(row: int, data: Dict[str, str]) -> None:
-    """Update several cells in one or a few contiguous range writes."""
-    if not row or not data:
-        return
-    head = headers_map(ws)
-    items = sorted((head[k], str(v or '')) for k, v in data.items() if head.get(k))
-    if not items:
-        return
-    groups = []
-    cur = [items[0]]
-    for col, value in items[1:]:
-        if col == cur[-1][0] + 1:
-            cur.append((col, value))
-        else:
-            groups.append(cur)
-            cur = [(col, value)]
-    groups.append(cur)
-    for group in groups:
-        start_col = group[0][0]
-        end_col = group[-1][0]
-        values = [[v for _, v in group]]
-        _retry_sheets(ws.update, f'{col_to_a1(start_col)}{row}:{col_to_a1(end_col)}{row}', values, value_input_option='USER_ENTERED')
-
-
-def order_row_values(row: int) -> Dict[str, str]:
-    """Read the whole order row once and return values by header name."""
-    head = headers_map(ws)
-    vals = _retry_sheets(ws.row_values, row)
-    result = {}
-    for name, col in head.items():
-        result[name] = vals[col - 1] if col - 1 < len(vals) else ''
-    return result
-
-
-def apply_np_profile_to_order(row: int, profile: dict) -> None:
-    """Write saved/current NP delivery profile to Лист1 in batched updates."""
-    phone_val = normalize_ua_phone(profile.get('recipient_phone', '')) or profile.get('recipient_phone', '')
-    data = {
-        'recipient_name': profile.get('recipient_name', ''),
-        'recipient_phone': phone_val,
-        'np_city_name': profile.get('np_city_name', ''),
-        'np_warehouse_desc': profile.get('np_warehouse_desc', ''),
-    }
-    if profile.get('np_city_ref'):
-        data['np_city_ref'] = profile.get('np_city_ref', '')
-    if profile.get('np_warehouse_ref'):
-        data['np_warehouse_ref'] = profile.get('np_warehouse_ref', '')
-    update_cells_by_names(row, data)
-
-
-def cached_np_profile_by_row(chat_id: int, row: int) -> Optional[dict]:
-    for p in NP_PROFILES_CACHE.get(str(chat_id).strip(), []):
-        if int(p.get('_row') or 0) == int(row):
-            return p
-    return None
-
 def append_row(values: Dict[str, str]) -> int:
-    """Create a new order strictly in the first fully free row of A:AE.
-
-    Do not use ws.append_row here. Google Sheets can mis-detect the table shape
-    when there are hidden/empty columns and append values to the right side.
-    This function writes directly to A{row}:AE{row}.
-    """
-    order_id = str(values.get('order_id') or '').strip()
-    if not order_id:
-        raise RuntimeError('append_row: order_id is required')
-
-    with APPEND_ROW_LOCK:
-        row = first_free_order_row()
-        update_row_values_a_to_ae(row, values)
-
-        # Update cache directly; no need for a slow verification read here.
-        ORDER_ROW_CACHE.setdefault('map', {})[order_id] = row
-        ORDER_ROW_CACHE['ts'] = time.time()
-        return row
+    head = headers_map(ws)
+    row_dict = {**{h: '' for h in head.keys()}, **values}
+    # Append row strictly within columns A to AE to avoid unintended new column creation.
+    _retry_sheets(
+        ws.append_row,
+        [row_dict.get(h, '') for h in head.keys()],
+        value_input_option='USER_ENTERED',
+        table_range='A:AE'
+    )
+    # invalidate cache so the next lookup sees the newly appended order_id
+    ORDER_ROW_CACHE["ts"] = 0.0
+    order_id = values.get('order_id')
+    row = find_row_by_order_id(order_id) if order_id else 0
+    # Do not fall back to ws.row_count when the order_id cannot be located; raising an exception
+    # forces the caller to handle the error and prevents phantom row numbers.
+    if not row:
+        raise RuntimeError(f"append_row: failed to locate created row for order_id={order_id!r}")
+    return row
 def update_joined(row: int, col_name: str, items: List[str]) -> str:
     prev = (get_cell(row, col_name) or '').strip()
     merged = (prev + ' ' if prev else '') + ' '.join(items)
@@ -678,7 +568,6 @@ def np_profile_get(chat_id: int) -> dict:
         return {}
 
 def np_profile_upsert(chat_id: int, profile: dict):
-    NP_PROFILES_CACHE.pop(str(chat_id).strip(), None)
     """
     MULTI-ROW LOGIC:
     - Для одного chat_id може бути багато адрес (рядків).
@@ -746,19 +635,11 @@ def np_profile_upsert(chat_id: int, profile: dict):
     ws2.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
 
 def np_save_current_delivery(chat_id: int, st):
-    """Read current delivery from Лист1 once and save/update it in Лист2."""
+    """Зчитує поточні поля з Лист1 і зберігає/оновлює профіль у Лист2 (upsert)."""
     try:
-        row = order_row_values(st.sheet_row)
-        np_profile_upsert(chat_id, {
-            'recipient_name': row.get('recipient_name', ''),
-            'recipient_phone': normalize_ua_phone(row.get('recipient_phone', '')) or row.get('recipient_phone', ''),
-            'np_city_name': row.get('np_city_name', ''),
-            'np_city_ref': row.get('np_city_ref', ''),
-            'np_warehouse_desc': row.get('np_warehouse_desc', ''),
-            'np_warehouse_ref': row.get('np_warehouse_ref', ''),
-        })
+        np_profile_upsert(chat_id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
     except Exception:
-        logger.exception('np_save_current_delivery failed')
+        pass
 
 def doctor_phone_get(chat_id: int) -> str:
     """
@@ -774,7 +655,6 @@ def doctor_phone_get(chat_id: int) -> str:
     return DOCTOR_PHONE_CACHE.get(str(chat_id).strip(), '')
 
 def doctor_phone_create(chat_id: int, phone: str):
-    NP_PROFILES_CACHE.pop(str(chat_id).strip(), None)
     """
     Create one profile row with chat_id + phone ONLY if no rows for chat_id exist.
     Does NOT update existing rows.
@@ -849,47 +729,44 @@ async def doctor_phone_save_bg(chat_id: int, phone: str) -> None:
             await asyncio.sleep(delay)
 
 def np_profiles_list(chat_id: int) -> List[dict]:
-    """Return saved NP delivery profiles from memory cache when possible.
-
-    Fallback to Sheets only if the cache is empty for this chat_id, then store the result.
-    """
-    key = str(chat_id).strip()
-    if key in NP_PROFILES_CACHE:
-        return [dict(p) for p in NP_PROFILES_CACHE.get(key, [])]
-
+    """1 read for whole chat_id column + 1 per matched row. No external helpers."""
     ws2 = np_profiles_ws()
     head = np_head(ws2)
     chat_col = head.get('chat_id')
     if not chat_col:
-        NP_PROFILES_CACHE[key] = []
         return []
-
-    rows = _retry_sheets(ws2.get_all_values)
+    col_vals = []
+    for i in range(3):
+        try:
+            col_vals = ws2.col_values(chat_col)
+            break
+        except Exception as e:
+            if 'Quota exceeded' in str(e) or '429' in str(e):
+                time.sleep(1 * 2 ** i)
+                continue
+            raise
+    target = str(chat_id).strip()
+    match_rows = [idx + 1 for idx, val in enumerate(col_vals) if str(val).strip() == target]
     profiles: List[dict] = []
+    for row in match_rows:
+        row_vals = []
+        for i in range(3):
+            try:
+                row_vals = ws2.row_values(row)
+                break
+            except Exception as e:
+                if 'Quota exceeded' in str(e) or '429' in str(e):
+                    time.sleep(1 * 2 ** i)
+                    continue
+                raise
 
-    def v(row_vals, k: str) -> str:
-        c = head.get(k)
-        return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
-
-    for row_num, row_vals in enumerate(rows[1:], start=2):
-        if str(v(row_vals, 'chat_id')).strip() != key:
-            continue
-        profile = {
-            '_row': row_num,
-            'recipient_name': v(row_vals, 'recipient_name'),
-            'recipient_phone': v(row_vals, 'recipient_phone'),
-            'np_city_name': v(row_vals, 'np_city_name'),
-            'np_city_ref': v(row_vals, 'np_city_ref'),
-            'np_warehouse_desc': v(row_vals, 'np_warehouse_desc'),
-            'np_warehouse_ref': v(row_vals, 'np_warehouse_ref'),
-        }
-        if any(profile.get(k) for k in ('recipient_name', 'recipient_phone', 'np_city_name', 'np_warehouse_desc', 'np_city_ref', 'np_warehouse_ref')):
-            profiles.append(profile)
-
-    NP_PROFILES_CACHE[key] = [dict(p) for p in profiles]
+        def v(k: str) -> str:
+            c = head.get(k)
+            return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
+        profiles.append({'_row': row, 'recipient_name': v('recipient_name'), 'recipient_phone': v('recipient_phone'), 'np_city_name': v('np_city_name'), 'np_city_ref': v('np_city_ref'), 'np_warehouse_desc': v('np_warehouse_desc'), 'np_warehouse_ref': v('np_warehouse_ref')})
     return profiles
+
 def np_profile_add(chat_id: int, profile: dict):
-    NP_PROFILES_CACHE.pop(str(chat_id).strip(), None)
     ws2 = np_profiles_ws()
     head = np_head(ws2)
     row_dict = {h: '' for h in head.keys()}
@@ -1623,10 +1500,12 @@ def nz(v):
     return v if v not in (None, '', 'None') else '—'
 
 def build_summary_text(st: OrderState) -> str:
-    row = order_row_values(st.sheet_row) if getattr(st, 'sheet_row', 0) else {}
-    v = lambda name: row.get(name, '')
+    v = lambda name: get_cell(st.sheet_row, name)
 
+    # сирий вміст комірки
     fm_raw = (v('files_method') or '').strip()
+
+    # мапа для "людських" назв
     files_map = {
         'telegram_upload': 'Завантаження у бот',
         'link': 'Посилання',
@@ -1634,6 +1513,7 @@ def build_summary_text(st: OrderState) -> str:
         'Imprint': 'Відбитки',
     }
 
+    # підтримка кількох методів через кому, але без зміни старої поведінки
     if ',' in fm_raw:
         parts = [p.strip() for p in fm_raw.split(',') if p.strip()]
         human_parts = [files_map.get(p, p) for p in parts]
@@ -1655,6 +1535,7 @@ def build_summary_text(st: OrderState) -> str:
         f"Технік звʼяжеться з Вами найближчим часом."
     )
 
+    # 2. Додатковий блок ТІЛЬКИ якщо серед методів є Imprint
     has_imprint = any(
         p.strip() == 'Imprint'
         for p in (fm_raw.split(',') if fm_raw else [])
@@ -1665,11 +1546,23 @@ def build_summary_text(st: OrderState) -> str:
             "\n\n"
             "Відбитки надсилайте:\n\n"
             "м. Одеса, 26 відділення\n"
-            "Отримувач: Вардгес Мхитарян\n"
-            "Телефон: 380631507701"
+            "тел.: 38 093 410 90 73\n"
+            "Амбарцумян Вардгес"
         )
 
     return base_text
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+async def notify_admin_new_order(msg: Message, st: OrderState):
+    text = f"<b>Нове замовлення</b>\nНомер: <b>{nz(st.order_id)}</b>\nЛікар: {(msg.from_user.full_name if msg.from_user else '')} {('@' + msg.from_user.username if msg.from_user and msg.from_user.username else '')}\nПацієнт: {st.patient_lastname}\nАпарат: {st.work_type}\nДата здачі: {st.due_date_iso}"
+    try:
+        if not ADMIN_CHAT_ID:
+            raise RuntimeError('ADMIN_CHAT_ID is empty or 0')
+        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode='HTML')
+    except Exception as e:
+        logger.warning('Admin notify failed: %s', e)
 
 @dp.message(CommandStart())
 async def start(msg: Message):
@@ -2145,9 +2038,21 @@ async def flow(msg: Message):
             if len(profiles) == 1:
                 p = profiles[0]
                 phone_val = normalize_ua_phone(p.get('recipient_phone', '')) or p.get('recipient_phone', '')
-                apply_np_profile_to_order(st.sheet_row, p)
+                # Safely write saved delivery details into the order row. Use _safe_set_cell to ensure
+                # the row belongs to this order and to queue the write if the row isn't yet available.
+                if not await _safe_set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''), msg): return
+                if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, msg): return
+                if not await _safe_set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''), msg): return
+                if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''), msg): return
                 if p.get('np_city_ref'):
+                    if not await _safe_set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'], msg): return
                     st.np_city_ref = p['np_city_ref']
+                if p.get('np_warehouse_ref'):
+                    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], msg): return
+                try:
+                    np_profile_upsert(msg.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
+                except Exception:
+                    pass
                 await msg.answer('Дані доставки підставлено.')
                 await _clear_inline_markup(msg)
                 await _clear_inline_markup(msg)
@@ -2422,14 +2327,26 @@ async def np_use_saved_cb(q: CallbackQuery):
     if len(profiles) == 1:
         p = profiles[0]
         phone_val = normalize_ua_phone(p.get('recipient_phone', '')) or p.get('recipient_phone', '')
-        apply_np_profile_to_order(st.sheet_row, p)
+        # Safely write saved delivery details into the order row.  Use _safe_set_cell to verify the row
+        # and queue the write if necessary.
+        if not await _safe_set_cell(st.sheet_row, 'recipient_name', p.get('recipient_name', ''), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_city_name', p.get('np_city_name', ''), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', p.get('np_warehouse_desc', ''), q.message): return await q.answer()
         if p.get('np_city_ref'):
+            if not await _safe_set_cell(st.sheet_row, 'np_city_ref', p['np_city_ref'], q.message): return await q.answer()
             st.np_city_ref = p['np_city_ref']
+        if p.get('np_warehouse_ref'):
+            if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'], q.message): return await q.answer()
+        try:
+            np_profile_upsert(q.message.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
+        except Exception:
+            pass
         await q.message.answer('Дані доставки підставлено.')
         await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         st.delivery_step = ''
         st.step = 'choose_files_method'
-        await save_bot_state_async(q.message.chat.id, st)
+        await save_bot_state_async(msg.chat.id, st)
         return await q.answer()
     rows = []
     for pr in profiles[:20]:
@@ -2461,30 +2378,33 @@ async def np_pick_cb(q: CallbackQuery):
         row = int(q.data.split(':', 1)[1])
     except Exception:
         return await q.answer()
+    ws2 = np_profiles_ws()
+    head = np_head(ws2)
+    row_vals = []
+    for i in range(3):
+        try:
+            row_vals = ws2.row_values(row)
+            break
+        except Exception as e:
+            if 'Quota exceeded' in str(e) or '429' in str(e):
+                time.sleep(1 * 2 ** i)
+                continue
+            raise
 
-    p = cached_np_profile_by_row(q.message.chat.id, row)
-    if not p:
-        # Fallback for old inline buttons created before cache warmup/restart.
-        ws2 = np_profiles_ws()
-        head = np_head(ws2)
-        row_vals = _retry_sheets(ws2.row_values, row)
-
-        def v(k: str) -> str:
-            c = head.get(k)
-            return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
-        p = {
-            '_row': row,
-            'recipient_name': v('recipient_name'),
-            'recipient_phone': v('recipient_phone'),
-            'np_city_name': v('np_city_name'),
-            'np_city_ref': v('np_city_ref'),
-            'np_warehouse_desc': v('np_warehouse_desc'),
-            'np_warehouse_ref': v('np_warehouse_ref'),
-        }
-
-    apply_np_profile_to_order(st.sheet_row, p)
-    if p.get('np_city_ref'):
-        st.np_city_ref = p.get('np_city_ref', '')
+    def v(k: str) -> str:
+        c = head.get(k)
+        return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
+    phone_val = normalize_ua_phone(v('recipient_phone')) or v('recipient_phone')
+    # Safely apply the picked NP profile values into the order row.
+    if not await _safe_set_cell(st.sheet_row, 'recipient_name', v('recipient_name'), q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'np_city_name', v('np_city_name'), q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', v('np_warehouse_desc'), q.message): return await q.answer()
+    if head.get('np_city_ref'):
+        if not await _safe_set_cell(st.sheet_row, 'np_city_ref', v('np_city_ref'), q.message): return await q.answer()
+        st.np_city_ref = v('np_city_ref')
+    if head.get('np_warehouse_ref'):
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', v('np_warehouse_ref'), q.message): return await q.answer()
     await q.message.answer('Дані доставки підставлено.')
     await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
     st.delivery_step = ''
@@ -2500,15 +2420,17 @@ async def np_city_pick_cb(q: CallbackQuery):
         await q.answer()
         return
     st.np_city_ref = ref
+    # Safely record the chosen city Ref
+    if not await _safe_set_cell(st.sheet_row, 'np_city_ref', ref, q.message):
+        return await q.answer()
     city_name = ''
     for c in getattr(st, 'last_np_cities', []) or []:
         if c.get('Ref') == ref:
             city_name = c.get('Description', '') or c.get('DescriptionRu', '')
             break
-    data = {'np_city_ref': ref}
     if city_name:
-        data['np_city_name'] = city_name
-    update_cells_by_names(st.sheet_row, data)
+        if not await _safe_set_cell(st.sheet_row, 'np_city_name', city_name, q.message):
+            return await q.answer()
     st.delivery_step = ''
     st.step = 'await_np_number'
     await q.message.answer('Введіть номер відділення або поштомату (наприклад: 15 або 2345).')
@@ -2523,13 +2445,16 @@ async def np_wh_pick_cb(q: CallbackQuery):
         if w.get('Ref') == ref:
             picked = w
             break
-    data = {'np_warehouse_ref': ref}
+    # Safely record the chosen warehouse ref
+    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', ref, q.message):
+        return await q.answer()
+    np_save_current_delivery(q.message.chat.id, st)
     if picked:
-        data['np_warehouse_desc'] = picked.get('Description', '')
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', picked.get('Description', ''), q.message):
+            return await q.answer()
         if picked.get('CityDescription'):
-            data['np_city_name'] = picked.get('CityDescription')
-    update_cells_by_names(st.sheet_row, data)
-    asyncio.create_task(asyncio.to_thread(np_save_current_delivery, q.message.chat.id, st))
+            if not await _safe_set_cell(st.sheet_row, 'np_city_name', picked.get('CityDescription'), q.message):
+                return await q.answer()
     st.delivery_step = ''
     st.step = 'choose_files_method'
     await q.message.answer('Адресу доставки збережено.')
