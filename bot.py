@@ -397,43 +397,50 @@ def find_row_by_order_id(order_id: str) -> int:
 
 def append_row(values: Dict[str, str]) -> int:
     """
-    Create a new order row strictly in the first fully empty row of A:AE.
+    Create a new order row strictly below the last row that has any data in A:AE.
 
-    Google Sheets append_row can mis-detect the table area when there are hidden,
-    empty or visually separated columns. In that case it can append data to the
-    right side of the sheet instead of starting from column A.
+    This function intentionally does NOT use ws.append_row for Лист1.
+    Google Sheets can mis-detect the table area and append values to the right
+    when the sheet has hidden/empty/visually separated columns.
 
-    This function never uses ws.append_row for Лист1.
-    It finds the first fully empty row inside A:AE and writes exactly A{row}:AE{row}.
+    Rules:
+    - read only A:AE;
+    - find the last row where at least one cell in A:AE has data;
+    - write the new order only to A{row}:AE{row};
+    - never write outside A:AE;
+    - never reuse empty-looking rows inside the existing table.
     """
     head = headers_map(ws)
-    ordered_headers = list(head.keys())[:31]  # A:AE = 31 columns
+    header_values = _retry_sheets(ws.row_values, 1) or []
+    header_values = list(header_values) + [''] * (31 - len(header_values))
 
     order_id = str(values.get('order_id') or '').strip()
     if not order_id:
         raise RuntimeError("append_row: order_id is required")
 
     with ORDER_WRITE_LOCK:
+        # Read the actual order table area only.
         table = _retry_sheets(ws.get, 'A:AE') or []
 
-        target_row = None
-        for row_num in range(2, len(table) + 1):
-            row_vals = table[row_num - 1] if row_num - 1 < len(table) else []
+        last_used_row = 1  # row 1 is headers
+        for row_num, row_vals in enumerate(table, start=1):
             padded = list(row_vals) + [''] * (31 - len(row_vals))
-            if all(str(v or '').strip() == '' for v in padded[:31]):
-                target_row = row_num
-                break
+            if any(str(v or '').strip() != '' for v in padded[:31]):
+                last_used_row = row_num
 
-        if target_row is None:
-            target_row = max(len(table) + 1, 2)
+        target_row = max(last_used_row + 1, 2)
 
+        # Extend rows if needed. Do not add columns.
         if target_row > ws.row_count:
             _retry_sheets(ws.add_rows, target_row - ws.row_count)
 
-        row_dict = {h: '' for h in ordered_headers}
-        row_dict.update(values)
-        row_values = [row_dict.get(h, '') for h in ordered_headers]
+        # Build exactly 31 values for A:AE, aligned by physical column position.
+        row_values = []
+        for i in range(31):
+            header_name = str(header_values[i] or '').strip()
+            row_values.append(values.get(header_name, '') if header_name else '')
 
+        # Hard write from column A to AE. This cannot start in S/U or any column to the right.
         _retry_sheets(
             ws.update,
             f'A{target_row}:AE{target_row}',
@@ -441,6 +448,7 @@ def append_row(values: Dict[str, str]) -> int:
             value_input_option='USER_ENTERED'
         )
 
+        # Keep existing order_id lookup cache compatible with the rest of the bot.
         ORDER_ROW_CACHE.setdefault("map", {})[order_id] = target_row
         ORDER_ROW_CACHE["ts"] = time.time()
 
