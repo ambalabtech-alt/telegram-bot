@@ -61,8 +61,7 @@ from google.oauth2.credentials import Credentials as UserCreds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger('ambalab')
 import html
-def _nonempty_text(s: str, min_len: int = 1) -> bool:
-    return bool((s or '').strip()) and len((s or '').strip()) >= min_len
+# Removed unused _nonempty_text helper
 
 def _text_only(s: str, min_len: int = 1) -> bool:
     """
@@ -190,10 +189,7 @@ assert OAUTH_CLIENT_SECRETS_JSON and os.path.exists(OAUTH_CLIENT_SECRETS_JSON), 
 assert NOVAPOSHTA_API_KEY, 'NOVAPOSHTA_API_KEY is empty'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive']
 PRICE_URL = 'https://drive.google.com/file/d/1kjTVfhkm384f35SkaogaRtDXwPqjFkJc/view?usp=drive_link'
-FILES_BATCH_ACK_DELAY_SEC = float(os.getenv('FILES_BATCH_ACK_DELAY_SEC', '1.2'))
-# The FILE_TAIL_TIMEOUT_SEC constant and related tail window logic have been removed.
-FILE_TAIL_TIMEOUT_SEC = int(os.getenv('FILE_TAIL_TIMEOUT_SEC', '15'))  # unused
-BOT_STATE_SHEET_NAME = os.getenv('BOT_STATE_SHEET_NAME', '_bot_state')
+# Removed FILES_BATCH_ACK_DELAY_SEC, FILE_TAIL_TIMEOUT_SEC and BOT_STATE_SHEET_NAME: legacy upload and bot state constants
 
 # ---
 # Опитування: назви аркушів для журналу та відповідей.
@@ -215,8 +211,7 @@ POLL_RESPONSES_SHEET_NAME = 'Відповіді_опитувань'
 # Increase these values if your users tend to send files slowly (for example if
 # they are large) or if you notice the bot splitting a single batch into
 # multiple waves.  Decrease them if you need faster feedback.
-FILES_WAVE_SILENCE_SEC = float(os.getenv('FILES_WAVE_SILENCE_SEC', '3.0'))
-LINKS_WAVE_SILENCE_SEC = float(os.getenv('LINKS_WAVE_SILENCE_SEC', '3.0'))
+# Removed FILES_WAVE_SILENCE_SEC and LINKS_WAVE_SILENCE_SEC: wave-based upload batching disabled
 
 
 def get_creds():
@@ -349,11 +344,7 @@ def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
         HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(_retry_sheets(ws_.row_values, 1))}
     return HEADERS_CACHE[cache_key]
 
-def invalidate_headers_cache(cache_key: Optional[str] = None) -> None:
-    if cache_key is None:
-        HEADERS_CACHE.clear()
-    else:
-        HEADERS_CACHE.pop(cache_key, None)
+# invalidate_headers_cache removed: unused function
 
 def headers_map(ws_) -> Dict[str, int]:
     cache_key = 'main_ws' if ws_ == ws else f'ws_{id(ws_)}'
@@ -582,26 +573,18 @@ def _restore_order_state_from_sheet(chat_id: int) -> Optional['OrderState']:
         logger.exception('Order restore from sheet failed')
         return None
 
-def bot_state_ws():
-    return None
+# Removed legacy bot_state helpers and unused boolean converters.  The bot
+# restores state directly from Sheets via `_restore_order_state_from_sheet()`.
 
-def bot_state_head() -> Dict[str, int]:
-    return {}
-
-def _bool_to_str(v: bool) -> str:
-    return '1' if v else '0'
-
-def _str_to_bool(v: str) -> bool:
-    return str(v).strip() in ('1', 'true', 'True', 'yes', 'Yes')
-
-def save_bot_state(chat_id: int, st: 'OrderState') -> None:
-    return None
-
+# Retain a minimal load_bot_state helper for compatibility with load_bot_state_async.
 def load_bot_state(chat_id: int) -> Optional['OrderState']:
-    return _restore_order_state_from_sheet(chat_id)
+    """Return the persisted OrderState for a chat by reading from Sheets.
 
-def delete_bot_state(chat_id: int) -> None:
-    return None
+    This synchronous helper simply forwards to `_restore_order_state_from_sheet`.
+    It exists solely because `load_bot_state_async` delegates to it via
+    `asyncio.to_thread()`.  Other bot code should use `load_bot_state_async`.
+    """
+    return _restore_order_state_from_sheet(chat_id)
 
 async def save_bot_state_async(chat_id: int, st: 'OrderState') -> None:
     return None
@@ -612,18 +595,7 @@ async def load_bot_state_async(chat_id: int) -> Optional['OrderState']:
 async def delete_bot_state_async(chat_id: int) -> None:
     return None
 
-def np_profile_get(chat_id: int) -> dict:
-    ws2 = np_profiles_ws()
-    head = np_head(ws2)
-    try:
-        row = ws2.find(str(chat_id)).row
-
-        def v(k):
-            c = head.get(k)
-            return ws2.cell(row, c).value if c else ''
-        return {'phone': v('phone'), 'recipient_name': v('recipient_name'), 'recipient_phone': v('recipient_phone'), 'np_city_name': v('np_city_name'), 'np_warehouse_desc': v('np_warehouse_desc')}
-    except Exception:
-        return {}
+# Removed np_profile_get: direct sheet lookups for NP profile are unused
 
 def np_profile_upsert(chat_id: int, profile: dict):
     """
@@ -862,12 +834,7 @@ def np_profiles_list(chat_id: int) -> List[dict]:
     NP_PROFILES_CACHE[cid] = [dict(p) for p in profiles]
     return profiles
 
-def np_profile_add(chat_id: int, profile: dict):
-    ws2 = np_profiles_ws()
-    head = np_head(ws2)
-    row_dict = {h: '' for h in head.keys()}
-    row_dict.update({'chat_id': str(chat_id), 'recipient_name': profile.get('recipient_name', ''), 'recipient_phone': profile.get('recipient_phone', ''), 'np_city_name': profile.get('np_city_name', ''), 'np_warehouse_desc': profile.get('np_warehouse_desc', ''), 'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M')})
-    ws2.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+# Removed np_profile_add: unused helper to append NP profile rows
 
 @dataclass
 class OrderState:
@@ -888,40 +855,11 @@ class OrderState:
     np_warehouse_ref: str = ''
     offtopic_tries: int = 0
     seen_boot_ts: int = 0
-    # The following group of fields implement the state machine for file and
-    # link upload “waves”.  A wave groups together multiple files or links
-    # arriving within a short period and ensures the bot sends only one
-    # acknowledgement per wave.  See `FILES_WAVE_SILENCE_SEC` and
-    # `LINKS_WAVE_SILENCE_SEC` for configuration.
-    files_wave_id: int = 0
-    files_wave_count: int = 0
-    files_wave_last_ts: float = 0.0
-    files_wave_ack_sent: bool = False
-    files_wave_closed: bool = False
-    files_wave_task: Optional[asyncio.Task] = None
-    files_done_cutoff_ts: float = 0.0
-    files_seen_keys: Set[str] = field(default_factory=set)
-    files_active_media_group_id: str = ''
-    files_active_media_group_last_ts: float = 0.0
-
-    links_wave_id: int = 0
-    links_wave_count: int = 0
-    links_wave_last_ts: float = 0.0
-    links_wave_ack_sent: bool = False
-    links_wave_closed: bool = False
-    links_wave_task: Optional[asyncio.Task] = None
-    links_done_cutoff_ts: float = 0.0
+    # Legacy wave-related fields removed: the bot no longer groups uploads into waves
     upload_step_token: int = 0
     upload_ui_closed: bool = False
 
-    # Flags to control when the user may press the “✅ Готово” button.
-    # During a file or link upload step the button should only work after
-    # the bot has acknowledged the current wave of uploads (see
-    # watch_files_wave/watch_links_wave).  These flags are reset to False
-    # whenever a new file or link arrives and set to True by the watcher
-    # once it sends the acknowledgement message.
-    files_done_allowed: bool = False
-    links_done_allowed: bool = False
+    # files_done_allowed and links_done_allowed removed: Done button is always enabled during upload steps
     # Lock used to prevent double-handling of the Done action.  When the
     # user presses “✅ Готово” and the action is processed, this flag is
     # temporarily set to True.  It is reset when the next step begins.
@@ -936,285 +874,44 @@ class OrderState:
 state_by_chat: Dict[int, OrderState] = {}
 
 # =============================================================================
-# Wave handling helpers
+# Wave handling helpers (removed)
 #
-# These functions implement the logic for grouping incoming files and links into
-# waves. A wave collects all items that arrive within a short period of
-# silence, measured by FILES_WAVE_SILENCE_SEC and LINKS_WAVE_SILENCE_SEC.
-# Exactly one acknowledgement message is sent at the end of each wave.  When
-# the user presses “✅ Готово”, the current wave is forcibly closed and no
-# further acknowledgements are sent for that step.
+# Earlier versions of this bot grouped incoming files and links into waves and
+# sent a single acknowledgement after a period of inactivity.  This logic and
+# associated constants have been removed.  Each file or link upload is now
+# acknowledged immediately with a minimal prompt.
 
-def reset_files_wave(st: 'OrderState') -> None:
-    """Resets the file wave state on the given order state.
-
-    Cancels any existing watcher task and clears counters, preparing to
-    accumulate a new wave of file uploads.  This should be called when
-    entering the file upload step.
-    """
-    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
-    st.upload_ui_closed = False
-    st.files_wave_id += 1
-    st.files_wave_count = 0
-    st.files_wave_last_ts = 0.0
-    st.files_wave_ack_sent = False
-    st.files_wave_closed = False
-    st.files_done_cutoff_ts = 0.0
-    # Legacy flags files_done_pressed, file_tail_open and last_file_update_ts removed.
-    st.files_seen_keys.clear()
-    st.files_active_media_group_id = ''
-    st.files_active_media_group_last_ts = 0.0
-    # cancel old watcher
-    task = getattr(st, 'files_wave_task', None)
-    if task and not task.done():
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    st.files_wave_task = None
+# Removed reset_files_wave: wave-based upload batching disabled
 
 
-def reset_links_wave(st: 'OrderState') -> None:
-    """Resets the link wave state on the given order state.
-
-    Similar to reset_files_wave but for external link uploads.
-    """
-    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
-    st.upload_ui_closed = False
-    st.links_wave_id += 1
-    st.links_wave_count = 0
-    st.links_wave_last_ts = 0.0
-    st.links_wave_ack_sent = False
-    st.links_wave_closed = False
-    st.links_done_cutoff_ts = 0.0
-    # cancel old watcher
-    task = getattr(st, 'links_wave_task', None)
-    if task and not task.done():
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    st.links_wave_task = None
+# Removed reset_links_wave: wave-based upload batching disabled
 
 
-def close_files_wave(st: 'OrderState') -> None:
-    """Forcibly closes the current file wave and its UI context."""
-    st.files_wave_closed = True
-    st.files_done_cutoff_ts = time.time()
-    # Legacy flags files_done_pressed, file_tail_open and last_file_update_ts removed.
-    st.upload_ui_closed = True
-    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
-    task = getattr(st, 'files_wave_task', None)
-    if task and not task.done():
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    st.files_wave_task = None
+# Removed close_files_wave: wave-based upload batching disabled
 
 
-def close_links_wave(st: 'OrderState') -> None:
-    """Forcibly closes the current link wave and its UI context."""
-    st.links_wave_closed = True
-    st.links_done_cutoff_ts = time.time()
-    st.upload_ui_closed = True
-    st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
-    task = getattr(st, 'links_wave_task', None)
-    if task and not task.done():
-        try:
-            task.cancel()
-        except Exception:
-            pass
-    st.links_wave_task = None
+# Removed close_links_wave: wave-based upload batching disabled
 
 
-def build_file_event_key(msg: Message) -> str:
-    """Builds a deduplication key for a file or photo event.
-
-    This prevents counting the same file more than once in a wave.
-    """
-    if msg.content_type == ContentType.DOCUMENT:
-        return f"doc:{msg.document.file_id}"
-    return f"photo:{msg.photo[-1].file_id}"
+# Removed build_file_event_key: no longer needed without file waves
 
 
-def touch_files_wave(st: 'OrderState', msg: Message) -> None:
-    """Updates the file wave state with a new file event.
-
-    Increments the count if this file has not been seen in the current wave and
-    updates the timestamp of the last file. If the previous wave has already
-    produced an acknowledgement and enough silence has passed, this function
-    automatically opens a NEW wave so the next burst of files also gets exactly
-    one acknowledgement.
-    """
-    now_ts = time.time()
-
-    # Reopen wave after a completed ack if a new burst starts later.
-    if st.files_wave_ack_sent and (now_ts - st.files_wave_last_ts) > FILES_WAVE_SILENCE_SEC:
-        st.files_wave_id += 1
-        st.files_wave_count = 0
-        st.files_wave_ack_sent = False
-        st.files_seen_keys.clear()
-        st.files_active_media_group_id = ''
-        st.files_active_media_group_last_ts = 0.0
-        st.files_wave_task = None
-
-    key = build_file_event_key(msg)
-    if key not in st.files_seen_keys:
-        st.files_seen_keys.add(key)
-        st.files_wave_count += 1
-    st.files_wave_last_ts = now_ts
-
-    # Track active media group to handle Telegram albums.
-    media_group_id = ''
-    try:
-        media_group_id = str(getattr(msg, 'media_group_id', '') or '')
-    except Exception:
-        media_group_id = ''
-    if media_group_id:
-        st.files_active_media_group_id = media_group_id
-        st.files_active_media_group_last_ts = now_ts
+# Removed touch_files_wave: wave-based upload batching disabled
 
 
-def touch_links_wave(st: 'OrderState', new_count: int) -> None:
-    """Updates the link wave state.
-
-    Increments the count by the number of new links and updates the timestamp
-    of the last link. If the previous link wave has already produced an
-    acknowledgement and enough silence has passed, a new wave is opened first.
-    """
-    if new_count <= 0:
-        return
-
-    now_ts = time.time()
-
-    # Reopen wave after a completed ack if a new burst starts later.
-    if st.links_wave_ack_sent and (now_ts - st.links_wave_last_ts) > LINKS_WAVE_SILENCE_SEC:
-        st.links_wave_id += 1
-        st.links_wave_count = 0
-        st.links_wave_ack_sent = False
-        st.links_wave_task = None
-
-    st.links_wave_count += new_count
-    st.links_wave_last_ts = now_ts
+# Removed touch_links_wave: wave-based upload batching disabled
 
 
-def ensure_files_wave_task(msg: Message, st: 'OrderState') -> None:
-    """Ensures that a watcher task is running for the current file wave.
-
-    If a watcher is already active nothing is done.  Otherwise a new
-    asynchronous task is created that will wait for a period of silence and
-    then send a single acknowledgement message to the user.  The task is
-    cancelled automatically when the wave is closed or the step changes.
-    """
-    if st.files_wave_closed:
-        return
-    task = getattr(st, 'files_wave_task', None)
-    if task is None or task.done():
-        wave_id = st.files_wave_id
-        token = int(getattr(st, 'upload_step_token', 0) or 0)
-        st.files_wave_task = asyncio.create_task(
-            watch_files_wave(msg.chat.id, st.order_id, wave_id, token)
-        )
+# Removed ensure_files_wave_task: wave-based upload batching disabled
 
 
-def ensure_links_wave_task(msg: Message, st: 'OrderState') -> None:
-    """Ensures that a watcher task is running for the current link wave.
-
-    Similar to ensure_files_wave_task but for links.
-    """
-    if st.links_wave_closed:
-        return
-    task = getattr(st, 'links_wave_task', None)
-    if task is None or task.done():
-        wave_id = st.links_wave_id
-        token = int(getattr(st, 'upload_step_token', 0) or 0)
-        st.links_wave_task = asyncio.create_task(
-            watch_links_wave(msg.chat.id, st.order_id, wave_id, token)
-        )
+# Removed ensure_links_wave_task: wave-based upload batching disabled
 
 
-async def watch_files_wave(chat_id: int, order_id: str, wave_id: int, upload_token: int) -> None:
-    """Watches for the end of a file upload wave.
-
-    This coroutine periodically checks whether the current wave has ended.  A
-    wave ends when there has been no new file for FILES_WAVE_SILENCE_SEC and
-    there is no active media group being received.  Once ended, the bot
-    sends exactly one acknowledgement message and marks the wave as
-    acknowledged.
-    """
-    while True:
-        await asyncio.sleep(0.35)
-        st = state_by_chat.get(chat_id)
-        if not st:
-            return
-        # if order changed or new wave started, exit
-        if st.order_id != order_id or st.files_wave_id != wave_id:
-            return
-        if int(getattr(st, 'upload_step_token', 0) or 0) != upload_token:
-            return
-        if getattr(st, 'upload_ui_closed', False):
-            return
-        # closed wave or ack already sent -> exit
-        if st.files_wave_closed or st.files_wave_ack_sent:
-            return
-        # if step changed away from file upload -> exit
-        if st.step != 'await_tele_files':
-            return
-        # if still receiving a Telegram album, wait a bit longer
-        if st.files_active_media_group_id:
-            if (time.time() - st.files_active_media_group_last_ts) < 1.0:
-                continue
-            st.files_active_media_group_id = ''
-            st.files_active_media_group_last_ts = 0.0
-        # if not enough silence yet, continue
-        silence = time.time() - st.files_wave_last_ts
-        if silence < FILES_WAVE_SILENCE_SEC:
-            continue
-        # send ack
-        try:
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
-            # Mark the current wave as acknowledged and enable the Done button.
-            st.files_wave_ack_sent = True
-            st.files_done_allowed = True
-        except Exception:
-            logger.exception('files wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
-        return
+# Removed watch_files_wave: wave-based upload batching disabled
 
 
-async def watch_links_wave(chat_id: int, order_id: str, wave_id: int, upload_token: int) -> None:
-    """Watches for the end of a link upload wave.
-
-    Similar to watch_files_wave but for external link uploads.  When the
-    silence period has elapsed and no ack has been sent, the bot sends a
-    single acknowledgement message.
-    """
-    while True:
-        await asyncio.sleep(0.35)
-        st = state_by_chat.get(chat_id)
-        if not st:
-            return
-        if st.order_id != order_id or st.links_wave_id != wave_id:
-            return
-        if int(getattr(st, 'upload_step_token', 0) or 0) != upload_token:
-            return
-        if getattr(st, 'upload_ui_closed', False):
-            return
-        if st.links_wave_closed or st.links_wave_ack_sent:
-            return
-        if st.step != 'await_links':
-            return
-        silence = time.time() - st.links_wave_last_ts
-        if silence < LINKS_WAVE_SILENCE_SEC:
-            continue
-        try:
-            await bot.send_message(chat_id, 'Можна докинути ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
-            # Mark the current link wave as acknowledged and enable the Done button.
-            st.links_wave_ack_sent = True
-            st.links_done_allowed = True
-        except Exception:
-            logger.exception('links wave ack send failed (chat_id=%s, order=%s)', chat_id, order_id)
-        return
+# Removed watch_links_wave: wave-based upload batching disabled
 
 # The file tail window logic has been removed.  Late uploads after the user presses Done are no longer accepted.
 
@@ -1366,14 +1063,7 @@ def notes_yesno_kb():
 def confirm_cancel_kb(one_time: bool=True) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Так, скасувати і в меню'), KeyboardButton(text='Ні, продовжити')], [KeyboardButton(text='⬅️ Назад'), KeyboardButton(text='🏠 Головне меню')]], resize_keyboard=True, one_time_keyboard=one_time)
 
-def _cancel_and_to_menu(msg: Message):
-    st = state_by_chat.get(msg.chat.id)
-    if st and getattr(st, 'sheet_row', None):
-        try:
-            set_cell(st.sheet_row, 'status', 'cancelled_by_user')
-        except Exception:
-            pass
-    state_by_chat[msg.chat.id] = OrderState()
+# Removed _cancel_and_to_menu: unused helper
 
 def _prev_step(st: OrderState) -> tuple[str, str]:
     sname = st.step or ''
@@ -1411,8 +1101,7 @@ def _prev_step(st: OrderState) -> tuple[str, str]:
 def gen_order_id() -> str:
     return f"{ORDER_PREFIX}-{now_kyiv().strftime('%y%m%d-%H%M%S')}"
     
-def extract_urls(text: str) -> List[str]:
-    return URL_RE.findall(text or '')
+# removed duplicate extract_urls definition (see top of file)
 
 def parse_date_uk(text: str) -> Optional[date]:
     m = DATE_RE.match((text or '').strip())
@@ -1458,18 +1147,7 @@ def normalize_ua_phone(s: str):
     if len(digits) >= 9:
         return '380' + digits[-9:]
     return None
-WH_RE = re.compile('(поштомат|відділення|viddilennya|poshtomat|postomat|branch)?\\s*(?:№|#|номер|no|num|n)?\\s*(\\d{1,4})', re.IGNORECASE)
-
-def normalize_wh_query(raw: str) -> str:
-    s = (raw or '').strip()
-    m = WH_RE.search(s)
-    if not m:
-        return s
-    kind, num = m.groups()
-    kind = (kind or '').lower()
-    if 'поштомат' in kind or 'postomat' in kind or 'poshtomat' in kind:
-        return f'Поштомат №{int(num)}'
-    return f'Відділення №{int(num)}'
+# Removed normalize_wh_query and associated regex WH_RE: unused normalization helper
 MAIN_BTNS = {'🧾 Зробити замовлення', '📂 Завантажити прайс', '📷 Instagram', "☎️ Зв'язатися з техніком"}
 
 async def _silent_autostart_on_first_menu_click(msg: Message):
@@ -1651,14 +1329,7 @@ def build_summary_text(st: OrderState) -> str:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-async def notify_admin_new_order(msg: Message, st: OrderState):
-    text = f"<b>Нове замовлення</b>\nНомер: <b>{nz(st.order_id)}</b>\nЛікар: {(msg.from_user.full_name if msg.from_user else '')} {('@' + msg.from_user.username if msg.from_user and msg.from_user.username else '')}\nПацієнт: {st.patient_lastname}\nАпарат: {st.work_type}\nДата здачі: {st.due_date_iso}"
-    try:
-        if not ADMIN_CHAT_ID:
-            raise RuntimeError('ADMIN_CHAT_ID is empty or 0')
-        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode='HTML')
-    except Exception as e:
-        logger.warning('Admin notify failed: %s', e)
+# Removed notify_admin_new_order: order notifications to technicians are handled outside of this bot
 
 @dp.message(CommandStart())
 async def start(msg: Message):
@@ -2283,7 +1954,7 @@ async def flow(msg: Message):
                 except Exception:
                     pass
                 await msg.answer('Дані доставки підставлено.')
-                await _clear_inline_markup(msg)
+                # Clear any lingering inline markup once before proceeding
                 await _clear_inline_markup(msg)
                 await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
                 st.delivery_step = ''
@@ -2323,8 +1994,7 @@ async def flow(msg: Message):
                 st.np_city_ref = ''
                 st.np_warehouse_ref = ''
             st.delivery_step = ''
-            await _clear_inline_markup(msg)
-            await _clear_inline_markup(msg)
+            # Show the file transfer options after clearing inline markup once at the beginning of this branch
             await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             st.step = 'choose_files_method'
             await save_bot_state_async(msg.chat.id, st)
@@ -2373,7 +2043,7 @@ async def flow(msg: Message):
             append_files_method(st.sheet_row, 'Imprint')
             await ask_notes(msg, st)
             return
-        await _clear_inline_markup(msg)
+        # Clear any lingering inline markup once before showing the method selection
         await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         return
@@ -2438,9 +2108,9 @@ async def flow(msg: Message):
         if is_done_text(msg.text or ''):
             st.upload_ui_closed = True
             st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
+            # Set files_expected status and email_sent flag; avoid duplicate status updates
             set_cell(st.sheet_row, 'status', 'files_expected')
             set_cell(st.sheet_row, 'email_sent', 'Yes')
-            set_cell(st.sheet_row, 'status', 'files_expected')
             # Batch acknowledgement invalidation removed
             await ask_notes(msg, st)
             return
@@ -2522,7 +2192,6 @@ def np_detect_kind(s: str):
         return (None, None)
     want_postomat = len(digits) > 3
     return (digits, want_postomat)
-    return
 
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
