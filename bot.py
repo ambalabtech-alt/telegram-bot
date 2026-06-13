@@ -278,7 +278,24 @@ def append_files_method(row: int, method_key: str):
 
 HEADERS_CACHE: Dict[str, Dict[str, int]] = {}
 
-# --- Doctor phone caching -----------------------------------------------------
+# --- NP profiles cache --------------------------------------------------------
+
+# Кеш для збережених адрес НП. Використовується для того, щоб не
+# читати всю таблицю Лист2 кожного разу при відображенні вибору адреси
+# Нової Пошти. Ключ — chat_id, значення — список профілів (словників з
+# полями, що відповідають колонкам Лист2).  Кеш наповнюється при
+# першому зверненні до np_profiles_list() для конкретного чату та
+# оновлюється при додаванні/оновленні адрес через np_profile_upsert().
+NP_PROFILES_CACHE: Dict[str, List[dict]] = {}
+
+# Guard to prevent double creation of orders when the doctor taps
+# the “Зробити замовлення” button multiple times in a short period.
+# The value is a Unix timestamp of the last order creation per chat_id.
+NEW_ORDER_GUARD: Dict[int, float] = {}
+# Time window in seconds during which repeated presses of the
+# “Зробити замовлення” button will be ignored.
+NEW_ORDER_GUARD_SEC: int = 60
+
 #
 # A simple in-memory cache for mapping Telegram chat IDs to the doctor's phone
 # number.  Loading phone numbers from Google Sheets on each order introduces
@@ -656,6 +673,7 @@ def np_profile_upsert(chat_id: int, profile: dict):
             same_row = row
             break
     if same_row:
+        # Update the existing row with new values
         for k, v in profile.items():
             c = head.get(k)
             if c:
@@ -665,15 +683,27 @@ def np_profile_upsert(chat_id: int, profile: dict):
                 ws2.update_cell(same_row, head['updated_at'], datetime.now().strftime('%Y-%m-%d %H:%M'))
             except Exception:
                 pass
-        return
-    row_dict = {h: '' for h in head.keys()}
-    row_dict['chat_id'] = str(chat_id)
-    for k, v in profile.items():
-        if k in head:
-            row_dict[k] = str(v or '')
-    if head.get('updated_at'):
-        row_dict['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
-    ws2.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+    else:
+        # Insert a new row for this chat_id
+        row_dict = {h: '' for h in head.keys()}
+        row_dict['chat_id'] = str(chat_id)
+        for k, v in profile.items():
+            if k in head:
+                row_dict[k] = str(v or '')
+        if head.get('updated_at'):
+            row_dict['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        ws2.append_row([row_dict.get(h, '') for h in head.keys()], value_input_option='USER_ENTERED')
+
+    # Invalidate the NP profiles cache for this chat_id so the next call to
+    # np_profiles_list will refresh from Sheets.  Use str(chat_id) to match the
+    # cache key format.
+    try:
+        cid = str(chat_id).strip()
+        NP_PROFILES_CACHE.pop(cid, None)
+    except Exception:
+        pass
+
+    return
 
 def np_save_current_delivery(chat_id: int, st):
     """Зчитує поточні поля з Лист1 і зберігає/оновлює профіль у Лист2 (upsert)."""
@@ -770,13 +800,28 @@ async def doctor_phone_save_bg(chat_id: int, phone: str) -> None:
             await asyncio.sleep(delay)
 
 def np_profiles_list(chat_id: int) -> List[dict]:
-    """1 read for whole chat_id column + 1 per matched row. No external helpers."""
+    """
+    Return a list of saved NP delivery profiles for the given chat_id.
+
+    To avoid repeated and potentially slow scans of the NP profiles sheet, an
+    in-memory cache (NP_PROFILES_CACHE) is consulted first.  If a cached
+    value exists for this chat_id the cached list is returned.  Otherwise
+    the sheet is read, the results cached and returned.  Each profile is
+    represented as a dict with keys matching the column names in Лист2.
+    """
+    cid = str(chat_id).strip()
+    cached = NP_PROFILES_CACHE.get(cid)
+    if cached is not None:
+        # Return a copy so callers do not accidentally mutate the cache
+        return [dict(p) for p in cached]
     ws2 = np_profiles_ws()
     head = np_head(ws2)
     chat_col = head.get('chat_id')
     if not chat_col:
+        NP_PROFILES_CACHE[cid] = []
         return []
-    col_vals = []
+    # Read the chat_id column with simple retry logic for transient quota errors
+    col_vals: List[str] = []
     for i in range(3):
         try:
             col_vals = ws2.col_values(chat_col)
@@ -786,11 +831,12 @@ def np_profiles_list(chat_id: int) -> List[dict]:
                 time.sleep(1 * 2 ** i)
                 continue
             raise
-    target = str(chat_id).strip()
+    target = cid
     match_rows = [idx + 1 for idx, val in enumerate(col_vals) if str(val).strip() == target]
     profiles: List[dict] = []
     for row in match_rows:
-        row_vals = []
+        # Read the entire row for matched rows, again with retry logic
+        row_vals: List[str] = []
         for i in range(3):
             try:
                 row_vals = ws2.row_values(row)
@@ -800,11 +846,20 @@ def np_profiles_list(chat_id: int) -> List[dict]:
                     time.sleep(1 * 2 ** i)
                     continue
                 raise
-
         def v(k: str) -> str:
             c = head.get(k)
             return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
-        profiles.append({'_row': row, 'recipient_name': v('recipient_name'), 'recipient_phone': v('recipient_phone'), 'np_city_name': v('np_city_name'), 'np_city_ref': v('np_city_ref'), 'np_warehouse_desc': v('np_warehouse_desc'), 'np_warehouse_ref': v('np_warehouse_ref')})
+        profiles.append({
+            '_row': row,
+            'recipient_name': v('recipient_name'),
+            'recipient_phone': v('recipient_phone'),
+            'np_city_name': v('np_city_name'),
+            'np_city_ref': v('np_city_ref'),
+            'np_warehouse_desc': v('np_warehouse_desc'),
+            'np_warehouse_ref': v('np_warehouse_ref'),
+        })
+    # Cache the result for future calls
+    NP_PROFILES_CACHE[cid] = [dict(p) for p in profiles]
     return profiles
 
 def np_profile_add(chat_id: int, profile: dict):
@@ -1654,6 +1709,30 @@ async def contact_tech(msg: Message):
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
+    # Prevent accidental double-order creation: if the doctor presses the
+    # "Зробити замовлення" button multiple times within a short window, do
+    # not start a new order again.  Check the global NEW_ORDER_GUARD dict
+    # keyed by chat_id.  If an entry exists and the previous order was
+    # created less than NEW_ORDER_GUARD_SEC seconds ago, simply ignore
+    # this request.  Optionally we could remind the doctor that an order
+    # is already in progress, but returning silently is sufficient to
+    # avoid duplicate rows.
+    now_ts = time.time()
+    guard_entry = NEW_ORDER_GUARD.get(msg.chat.id)
+    if guard_entry:
+        guard_ts = guard_entry.get('ts') if isinstance(guard_entry, dict) else guard_entry
+        try:
+            elapsed = now_ts - float(guard_ts or 0)
+        except Exception:
+            elapsed = now_ts
+        if elapsed < NEW_ORDER_GUARD_SEC:
+            # A recent order exists; do not create a new one.
+            st_existing = state_by_chat.get(msg.chat.id)
+            if st_existing:
+                # Optionally reprompt the current step; here we simply return.
+                return
+    # Record the timestamp early to guard against race conditions
+    NEW_ORDER_GUARD[msg.chat.id] = {'ts': now_ts}
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
     st = OrderState()
@@ -1686,17 +1765,81 @@ async def ask_notes(msg: Message, st: OrderState):
     await save_bot_state_async(msg.chat.id, st)
 
 async def finalize_order(msg: Message, st: OrderState):
+    # Prevent double-finalization
     if getattr(st, 'finalized', False):
         return
-    # Batch acknowledgement invalidation removed
     st.finalized = True
-    try:
-        if getattr(st, 'sheet_row', 0):
-            set_cell(st.sheet_row, 'status', 'order_submitted')
-    except Exception:
-        logger.exception('Failed to set final status')
 
-    await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
+    # Ensure we operate on the correct sheet row for this order.  If the
+    # remembered sheet_row does not match the order_id (e.g. due to row
+    # deletion or movement) attempt to find the row by order_id.  If
+    # still not found, create a new row and restore as much data as
+    # possible from the OrderState before marking it submitted.
+    try:
+        # Determine the current row by order_id
+        current_row = 0
+        try:
+            current_row = find_row_by_order_id(st.order_id)
+        except Exception:
+            current_row = 0
+        if current_row:
+            st.sheet_row = current_row
+        # If the row is missing entirely, append a new one
+        if not current_row:
+            # Build base values similar to those used when starting an order
+            phone = doctor_phone_get(msg.chat.id)
+            base_values = {
+                'order_id': st.order_id,
+                'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'),
+                'doctor_name': msg.from_user.full_name if msg.from_user else '',
+                'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '',
+                'chat_id': str(msg.chat.id),
+                'phone': phone,
+                'status': 'new',
+            }
+            # Append the new row synchronously to avoid interfering with finalization
+            try:
+                new_row = append_row(base_values)
+                st.sheet_row = new_row or st.sheet_row
+            except Exception:
+                logger.exception('Failed to append replacement row for missing order')
+            # Restore key fields that were collected earlier
+            row = st.sheet_row
+            if row:
+                try:
+                    if st.patient_lastname:
+                        set_cell(row, 'patient_lastname', st.patient_lastname)
+                    if st.work_type:
+                        set_cell(row, 'work_type', st.work_type)
+                    if st.due_date_iso:
+                        # Convert ISO date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) to dd.mm
+                        try:
+                            dt = datetime.fromisoformat(st.due_date_iso)
+                            set_cell(row, 'due_date', dt.strftime('%d.%m.%Y'))
+                        except Exception:
+                            pass
+                    # NP delivery refs if available
+                    if getattr(st, 'np_city_ref', None):
+                        set_cell(row, 'np_city_ref', st.np_city_ref)
+                    if getattr(st, 'np_warehouse_ref', None):
+                        set_cell(row, 'np_warehouse_ref', st.np_warehouse_ref)
+                except Exception:
+                    logger.exception('Failed to restore data to replacement row')
+        # Set the final status
+        if getattr(st, 'sheet_row', 0):
+            try:
+                set_cell(st.sheet_row, 'status', 'order_submitted')
+            except Exception:
+                logger.exception('Failed to set final status')
+    except Exception:
+        logger.exception('Error during finalize_order')
+
+    # Send summary and reset state
+    try:
+        await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
+    except Exception:
+        logger.exception('Failed to send summary')
+    # Reset state for this chat
     state_by_chat[msg.chat.id] = OrderState()
     await delete_bot_state_async(msg.chat.id)
 
@@ -1709,6 +1852,52 @@ async def flow(msg: Message):
             state_by_chat[msg.chat.id] = st
     if st:
         # Tail window refresh removed
+        pass
+
+    # Automatically cancel orders that were started on a previous day and not
+    # completed.  If the order is still in progress the next day, mark the
+    # corresponding row as auto_cancelled, clear the state and return to the
+    # main menu.  We do this only when a sheet row and created_at field
+    # exist.  If parsing fails or the row is not found, skip auto cancel.
+    try:
+        if st and st.order_id and not getattr(st, 'finalized', False):
+            row = getattr(st, 'sheet_row', 0)
+            # Refresh row by order_id if necessary
+            if row:
+                try:
+                    current_oid = (get_cell(row, 'order_id') or '').strip()
+                    if current_oid != st.order_id:
+                        new_row = find_row_by_order_id(st.order_id)
+                        if new_row:
+                            row = new_row
+                            st.sheet_row = new_row
+                except Exception:
+                    pass
+            if row:
+                created_str = ''
+                try:
+                    created_str = get_cell(row, 'created_at') or ''
+                except Exception:
+                    created_str = ''
+                if created_str:
+                    try:
+                        # created_at is stored as 'dd.mm.YYYY HH:MM:SS'
+                        created_dt = datetime.strptime(created_str.split()[0], '%d.%m.%Y')
+                        if created_dt.date() < now_kyiv().date():
+                            # Cancel and clear
+                            try:
+                                set_cell(row, 'status', 'auto_cancelled')
+                            except Exception:
+                                pass
+                            state_by_chat[msg.chat.id] = OrderState()
+                            await delete_bot_state_async(msg.chat.id)
+                            # Return to main menu quietly (no extra explanation)
+                            await msg.answer('Замовлення скасовано.', reply_markup=main_kb())
+                            return
+                    except Exception:
+                        pass
+    except Exception:
+        # On any failure, skip auto-cancel logic
         pass
 
     # Додатковий захист: URL/посилання поза сценарієм — також у Головне меню
@@ -1859,15 +2048,16 @@ async def flow(msg: Message):
             await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             return
     allowed_done_states = {'await_tele_files', 'await_links', 'email_wait_done', 'await_notes', 'await_notes_choice'}
-    if text == '✅ Готово' and (not st or st.step not in allowed_done_states):
-        # Ignore Done presses outside of upload or note steps.
+    # Treat typed variants of "готово" as Done.  Ignore Done presses outside of
+    # upload or note steps so the button does not cancel other operations.
+    if is_done_text(text) and (not st or st.step not in allowed_done_states):
         return
     if not st:
         state_by_chat[msg.chat.id] = OrderState()
         return await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
     if st and st.step == 'await_notes_choice':
         choice = (msg.text or '').strip()
-        if choice == '✅ Готово':
+        if is_done_text(choice):
             return
         if choice == 'Так':
             await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
@@ -2188,7 +2378,8 @@ async def flow(msg: Message):
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         return
     if st.step == 'await_links':
-        if (msg.text or '').strip() == '✅ Готово':
+        # If the user indicates they are done (via button or typed text), finish this step
+        if is_done_text(msg.text or ''):
             if st.done_lock:
                 return
             st.done_lock = True
@@ -2224,9 +2415,11 @@ async def flow(msg: Message):
         row_snapshot = getattr(st, 'sheet_row', 0)
         order_id_snapshot = st.order_id
         asyncio.create_task(_save_links_best_effort(new_urls, row_snapshot, order_id_snapshot))
+        # Reactivate the reply keyboard silently so the doctor can continue adding links
+        asyncio.create_task(refresh_reply_keyboard(msg, files_aux_kb()))
         return
     if st.step == 'await_tele_files':
-        if (msg.text or '').strip() == '✅ Готово':
+        if is_done_text(msg.text or ''):
             if st.done_lock:
                 return
             st.done_lock = True
@@ -2240,7 +2433,7 @@ async def flow(msg: Message):
             st.done_lock = False
             return
     if st.step == 'email_wait_done':
-        if (msg.text or '').strip() == '✅ Готово':
+        if is_done_text(msg.text or ''):
             st.upload_ui_closed = True
             st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
             set_cell(st.sheet_row, 'status', 'files_expected')
@@ -2253,7 +2446,8 @@ async def flow(msg: Message):
         await handle_telegram_upload(msg, st, silent=False, is_tail=False)
         return
     if st.step == 'await_notes':
-        if (msg.text or '').strip() == '✅ Готово':
+        # If user typed Done or pressed the button
+        if is_done_text(msg.text or ''):
             return await finalize_order(msg, st)
         if st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE:
             file_id_tg = msg.voice.file_id
@@ -2281,6 +2475,8 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
+            # Refresh the reply keyboard silently for notes step
+            asyncio.create_task(refresh_reply_keyboard(msg, done_kb()))
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -2292,6 +2488,8 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
+            # Reactivate keyboard silently
+            asyncio.create_task(refresh_reply_keyboard(msg, done_kb()))
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
@@ -2375,15 +2573,15 @@ async def np_use_saved_cb(q: CallbackQuery):
             st.np_city_ref = p['np_city_ref']
         if p.get('np_warehouse_ref'):
             set_cell(st.sheet_row, 'np_warehouse_ref', p['np_warehouse_ref'])
-        try:
-            np_profile_upsert(q.message.chat.id, {'recipient_name': get_cell(st.sheet_row, 'recipient_name'), 'recipient_phone': normalize_ua_phone(get_cell(st.sheet_row, 'recipient_phone')) or get_cell(st.sheet_row, 'recipient_phone'), 'np_city_name': get_cell(st.sheet_row, 'np_city_name'), 'np_city_ref': get_cell(st.sheet_row, 'np_city_ref'), 'np_warehouse_desc': get_cell(st.sheet_row, 'np_warehouse_desc'), 'np_warehouse_ref': get_cell(st.sheet_row, 'np_warehouse_ref')})
-        except Exception:
-            pass
+        # Do not upsert the profile when using a saved address.  We only
+        # upsert on new addresses; otherwise duplicates may be created.  Simply
+        # inform the user that the delivery data has been applied and proceed.
         await q.message.answer('Дані доставки підставлено.')
         await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         st.delivery_step = ''
         st.step = 'choose_files_method'
-        await save_bot_state_async(msg.chat.id, st)
+        # Persist the updated state
+        await save_bot_state_async(q.message.chat.id, st)
         return await q.answer()
     rows = []
     for pr in profiles[:20]:
@@ -2582,6 +2780,53 @@ def _parse_created_at(s: str):
         return dt.replace(tzinfo=ZoneInfo('Europe/Kyiv'))
     except Exception:
         return None
+
+# -----------------------------------------------------------------------------
+# Helper functions for user input and keyboard handling
+#
+# 1. is_done_text(text: str) -> bool
+#    Returns True if the provided text represents a “done” command.  This
+#    function normalizes case and whitespace and treats common variants such
+#    as “готово”, “Готово”, “ГОТОВО” and the emoji-based “✅ Готово” as
+#    equivalent.  It allows the doctor to type “готово” manually when the
+#    reply keyboard is hidden.
+#
+# 2. refresh_reply_keyboard(msg: Message, kb: ReplyKeyboardMarkup) -> None
+#    Sends a zero-width space to the chat with the provided reply keyboard
+#    markup and immediately deletes the message.  This has the effect of
+#    re-activating the reply keyboard without leaving any visible messages in
+#    the chat history.  It should only be used sparingly on steps such as
+#    await_links and await_notes where Telegram hides the keyboard after the
+#    user enters a message.
+
+def is_done_text(text: Optional[str]) -> bool:
+    """Determine whether a text message should be treated as a Done action."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    # Normalize common variations: remove emoji tick if present
+    t = t.replace('✅', '').strip()
+    return t in {'готово', 'done', '+'}
+
+async def refresh_reply_keyboard(msg: Message, kb: ReplyKeyboardMarkup) -> None:
+    """Silently re-send a reply keyboard to re-activate it.
+
+    Telegram hides the reply keyboard after the user types a message.
+    To make the keyboard visible again without spamming the chat, we send
+    a message consisting of a zero-width space and immediately delete it.
+    If sending or deleting fails we ignore the exception.
+    """
+    try:
+        tmp = await msg.answer("\u200b", reply_markup=kb)
+        # Give Telegram a short time to display the keyboard before deleting
+        await asyncio.sleep(0.15)
+        try:
+            await msg.bot.delete_message(chat_id=msg.chat.id, message_id=tmp.message_id)
+        except Exception:
+            pass
+    except Exception:
+        # If we fail to send or delete, silently ignore
+        pass
 
 # === Retry helpers for Google Sheets (503/429) ===
 import gspread
