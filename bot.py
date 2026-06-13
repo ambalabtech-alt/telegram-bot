@@ -2414,9 +2414,12 @@ async def flow(msg: Message):
                 logger.exception('links best-effort save failed')
         row_snapshot = getattr(st, 'sheet_row', 0)
         order_id_snapshot = st.order_id
+        # Save the new URLs in the background so we don't block the chat
         asyncio.create_task(_save_links_best_effort(new_urls, row_snapshot, order_id_snapshot))
-        # Reactivate the reply keyboard silently so the doctor can continue adding links
-        asyncio.create_task(refresh_reply_keyboard(msg, files_aux_kb()))
+        # Immediately re‑activate the reply keyboard for the link step.  Doing
+        # this synchronously ensures the «✅ Готово» button is visible right
+        # after a doctor sends a link, without spamming them with extra messages.
+        await refresh_reply_keyboard(msg, files_aux_kb())
         return
     if st.step == 'await_tele_files':
         if is_done_text(msg.text or ''):
@@ -2475,8 +2478,10 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('Voice upload error')
             asyncio.create_task(_save_voice_best_effort())
-            # Refresh the reply keyboard silently for notes step
-            asyncio.create_task(refresh_reply_keyboard(msg, done_kb()))
+            # Re‑activate the reply keyboard immediately so the doctor can continue
+            # adding notes or press «✅ Готово».  Executing this synchronously
+            # avoids missed keyboard popups on some clients.
+            await refresh_reply_keyboard(msg, done_kb())
             return
         if msg.text:
             st.accepted_notes_count += 1
@@ -2488,8 +2493,10 @@ async def flow(msg: Message):
                 except Exception:
                     logger.exception('notes best-effort save failed')
             asyncio.create_task(_save_note_best_effort())
-            # Reactivate keyboard silently
-            asyncio.create_task(refresh_reply_keyboard(msg, done_kb()))
+            # Immediately re‑activate the reply keyboard for the notes step.  This
+            # ensures the «✅ Готово» button appears after each text note without
+            # sending extra confirmation messages.
+            await refresh_reply_keyboard(msg, done_kb())
             return
         await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
         return
