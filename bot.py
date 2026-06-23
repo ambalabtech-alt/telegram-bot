@@ -183,22 +183,14 @@ DRIVE_PARENT_FOLDER_ID = os.getenv('DRIVE_PARENT_FOLDER_ID', '').strip() or None
 LAB_EMAIL = os.getenv('LAB_EMAIL', '').strip() or 'orders@example.com'
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '0'))
 
-#
-# Additional configuration for technical notifications and contact handling.
-#
-# TECH_CHAT_IDS defines a list of Telegram chat IDs that should receive
-# notifications about newly created orders.  By default this list includes
-# the primary admin and any additional technicians.  The IDs below
-# (6696112381, 531973310) correspond to newly added technicians.  You can
-# adjust this list in the environment by changing ADMIN_CHAT_ID or by
-# modifying the constants directly here.
-TECH_CHAT_IDS = [ADMIN_CHAT_ID, 6696112381, 531973310]
+TECH_CHAT_IDS = [
+    ADMIN_CHAT_ID,
+    6696112381,
+    531973310,
+]
 
-# WORK_CONTACT_CHAT_ID is used when a doctor presses the
-# "Зв'язатися з техніком" button.  Messages requesting contact will be sent
-# to this chat ID.  The value below (8053006968) corresponds to the shared
-# working chat where such requests should be delivered.
 WORK_CONTACT_CHAT_ID = 8053006968
+
 DRIVE_SHARE_ANYONE = os.getenv('DRIVE_SHARE_ANYONE', '0') == '1'
 NOVAPOSHTA_API_KEY = os.getenv('NOVAPOSHTA_API_KEY', '').strip()
 assert BOT_TOKEN, 'BOT_TOKEN is empty'
@@ -1678,9 +1670,7 @@ async def notify_admin_new_order(msg: Message, st: OrderState):
         f"Апарат: {st.work_type}\n"
         f"Дата здачі: {st.due_date_iso}"
     )
-    # Send the notification to all configured technician chat IDs.  If a
-    # particular ID is zero or evaluates to False it will be skipped.  This
-    # allows TECH_CHAT_IDS to include placeholder values without breaking.
+
     for chat_id in TECH_CHAT_IDS:
         try:
             if not chat_id:
@@ -1728,10 +1718,6 @@ async def contact_tech(msg: Message):
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
     try:
-        # When a doctor requests to contact a technician, send the request to
-        # the dedicated working chat.  We no longer send these to the
-        # individual admin chat because multiple technicians now handle
-        # new orders.  Only send if WORK_CONTACT_CHAT_ID is set.
         if WORK_CONTACT_CHAT_ID:
             doctor = msg.from_user.full_name if msg.from_user else ''
             uname = f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else ''
@@ -1870,6 +1856,13 @@ async def finalize_order(msg: Message, st: OrderState):
     except Exception:
         logger.exception('Error during finalize_order')
 
+    # Notify technicians about the submitted order.
+    # This was missing, so notify_admin_new_order existed but was never called.
+    try:
+        await notify_admin_new_order(msg, st)
+    except Exception:
+        logger.exception('Failed to notify technicians about new order')
+
     # Send summary and reset state
     try:
         await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
@@ -1920,14 +1913,10 @@ async def flow(msg: Message):
                         # created_at is stored as 'dd.mm.YYYY HH:MM:SS'
                         created_dt = datetime.strptime(created_str.split()[0], '%d.%m.%Y')
                         if created_dt.date() < now_kyiv().date():
-                            # This order was started on a previous day and is still
-                            # unfinished.  Clear the state and return to the main
-                            # menu without marking the row or sending a
-                            # cancellation notice.  The lab handles cleanup of
-                            # outdated rows separately.
+                            # Старе незавершене замовлення: тихо очищаємо стан.
+                            # Нічого не пишемо в таблицю і не повідомляємо про скасування.
                             state_by_chat[msg.chat.id] = OrderState()
                             await delete_bot_state_async(msg.chat.id)
-                            # Greet the user with the standard main menu prompt.
                             await msg.answer(
                                 'Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».',
                                 reply_markup=main_kb()
@@ -1957,71 +1946,45 @@ async def flow(msg: Message):
                 state_by_chat[msg.chat.id] = OrderState()
                 await delete_bot_state_async(msg.chat.id)
                 return
-    # Жорсткий захист: будь-який неочікуваний НЕ-текст → Головне меню.
+    # Відновлення стану для файлів після рестарту/втрати памʼяті.
+    # Якщо лікар надсилає документ або фото, але бот не памʼятає крок,
+    # пробуємо знайти активне замовлення у таблиці. Якщо в ньому спосіб
+    # передачі файлів telegram_upload, приймаємо файл і не відправляємо
+    # лікаря у fallback "притримуйтесь сценарію".
+    if msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO):
+        st = state_by_chat.get(msg.chat.id)
+        if not st or not getattr(st, 'order_id', ''):
+            try:
+                restored = await load_bot_state_async(msg.chat.id)
+            except Exception:
+                restored = None
+            if restored:
+                st = restored
+                state_by_chat[msg.chat.id] = restored
+
+        if st:
+            try:
+                row = getattr(st, 'sheet_row', 0) or 0
+                files_method_val = ''
+                if row:
+                    try:
+                        files_method_val = get_cell(row, 'files_method') or ''
+                    except Exception:
+                        files_method_val = ''
+                if 'telegram_upload' in (files_method_val or '').lower():
+                    st.step = 'await_tele_files'
+                    try:
+                        await save_bot_state_async(msg.chat.id, st)
+                    except Exception:
+                        pass
+                    await handle_telegram_upload(msg, st, silent=False, is_tail=False)
+                    return
+            except Exception:
+                logger.exception('File state restore failed')
+
+    # Жорсткий захист: будь-який неочікуваний НЕ-текст → Головне меню
     st = state_by_chat.get(msg.chat.id)
     if msg.content_type != 'text':
-        # --- Enhanced document/photo handling ---
-        # If a document or photo arrives outside of the expected file upload
-        # state, attempt to recover the order state and accept the file.  This
-        # addresses cases where the bot process has restarted and lost the
-        # in-memory state but a doctor continues to send STL/PLY/ZIP/etc.
-        #
-        # The logic is as follows:
-        # 1. Ensure we have a state object for this chat; reload it from
-        #    persistent storage if necessary.
-        # 2. If we have a sheet row and the order's files_method column
-        #    contains 'telegram_upload', update the step to 'await_tele_files'.
-        # 3. If the step is 'await_tele_files', process the upload via
-        #    handle_telegram_upload and return early, skipping fallback.
-        if msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO):
-            # Reload state from storage if not present
-            if not st:
-                try:
-                    st_loaded = await load_bot_state_async(msg.chat.id)
-                except Exception:
-                    st_loaded = None
-                if st_loaded:
-                    st = st_loaded
-                    state_by_chat[msg.chat.id] = st_loaded
-            # If we still have a state, attempt to detect telegram upload method
-            if st:
-                try:
-                    row = getattr(st, 'sheet_row', 0) or 0
-                    # Refresh the row if the cached order_id does not match
-                    if not row and getattr(st, 'order_id', None):
-                        try:
-                            row = find_row_by_order_id(st.order_id)
-                            if row:
-                                st.sheet_row = row
-                        except Exception:
-                            row = 0
-                    files_method_val = ''
-                    if row:
-                        try:
-                            files_method_val = get_cell(row, 'files_method') or ''
-                        except Exception:
-                            files_method_val = ''
-                    # Normalize and check for telegram upload marker
-                    if 'telegram_upload' in (files_method_val or '').lower():
-                        # If step is different, update it to await_tele_files
-                        if st.step != 'await_tele_files':
-                            st.step = 'await_tele_files'
-                            # Persist the updated state silently
-                            try:
-                                await save_bot_state_async(msg.chat.id, st)
-                            except Exception:
-                                pass
-                        # Process the document/photo as part of the telegram upload
-                        try:
-                            await handle_telegram_upload(msg, st, silent=False, is_tail=False)
-                            return
-                        except Exception:
-                            # If processing fails, fall through to fallback
-                            pass
-                except Exception:
-                    # On any error, fall back to existing logic
-                    pass
-        # Determine if we were expecting a file or voice message
         expecting_file = st and st.step == 'await_tele_files' and msg.content_type in (ContentType.DOCUMENT, ContentType.PHOTO)
         expecting_voice = st and st.step == 'await_notes' and msg.content_type == ContentType.VOICE
         # Tail file support removed: uploads after Done are no longer accepted.
