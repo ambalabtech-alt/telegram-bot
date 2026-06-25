@@ -184,7 +184,6 @@ LAB_EMAIL = os.getenv('LAB_EMAIL', '').strip() or 'orders@example.com'
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '0'))
 
 TECH_CHAT_IDS = [
-    ADMIN_CHAT_ID,
     6696112381,
     531973310,
 ]
