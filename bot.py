@@ -1671,10 +1671,16 @@ async def notify_admin_new_order(msg: Message, st: OrderState):
         f"Дата здачі: {st.due_date_iso}"
     )
 
+    sent_chat_ids = set()
     for chat_id in TECH_CHAT_IDS:
         try:
             if not chat_id:
                 continue
+            chat_id = int(chat_id)
+            if chat_id in sent_chat_ids:
+                logger.info('Tech notify skipped duplicate chat_id=%s for order=%s', chat_id, st.order_id)
+                continue
+            sent_chat_ids.add(chat_id)
             await bot.send_message(chat_id, text, parse_mode='HTML')
         except Exception as e:
             logger.warning('Tech notify failed for %s: %s', chat_id, e)
@@ -2093,8 +2099,8 @@ async def flow(msg: Message):
                     'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите - натисніть «✅ Готово».', done_kb()),
                     'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', notes_yesno_kb()),
                     'await_notes': (
-                        '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».',
-                        done_kb(),
+                        '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля першого збереженого повідомлення зʼявиться кнопка «✅ Готово».',
+                        bottom_nav_kb(),
                     ),
                 }
                 hint, kb = reprompt_map.get(st.step, ('Готові продовжити замовлення.', bottom_nav_kb()))
@@ -2124,7 +2130,11 @@ async def flow(msg: Message):
         if is_done_text(choice):
             return
         if choice == 'Так':
-            await _refresh_done_keyboard(msg, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
+            await msg.answer(
+                '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля першого збереженого повідомлення зʼявиться кнопка «✅ Готово».',
+                reply_markup=bottom_nav_kb(),
+                parse_mode='HTML'
+            )
             st.step = 'await_notes'
             await save_bot_state_async(msg.chat.id, st)
             return
@@ -2520,8 +2530,6 @@ async def flow(msg: Message):
             st.accepted_notes_count += 1
             async def _save_voice_best_effort():
                 try:
-                    prev = get_cell(st.sheet_row, 'voice_id')
-                    set_cell(st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
                     file = await bot.get_file(file_id_tg)
                     buf = await bot.download_file(file.file_path)
                     if hasattr(buf, 'read'):
@@ -2540,6 +2548,13 @@ async def flow(msg: Message):
                     set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
                 except Exception:
                     logger.exception('Voice upload error')
+            try:
+                prev = await asyncio.to_thread(get_cell, st.sheet_row, 'voice_id')
+                await asyncio.to_thread(set_cell, st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
+            except Exception:
+                logger.exception('voice_id save failed')
+                await msg.answer('Не вдалося зберегти голосове повідомлення. Спробуйте надіслати ще раз.', reply_markup=bottom_nav_kb())
+                return
             asyncio.create_task(_save_voice_best_effort())
             # Після збереження голосового повідомлення надішліть коротку підказку з клавіатурою
             # Користувач може додати ще повідомлення або натиснути «✅ Готово»
@@ -2554,12 +2569,18 @@ async def flow(msg: Message):
                     set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
                 except Exception:
                     logger.exception('notes best-effort save failed')
-            asyncio.create_task(_save_note_best_effort())
+            try:
+                prev = await asyncio.to_thread(get_cell, st.sheet_row, 'notes')
+                await asyncio.to_thread(set_cell, st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
+            except Exception:
+                logger.exception('notes save failed')
+                await msg.answer('Не вдалося зберегти повідомлення. Спробуйте надіслати ще раз.', reply_markup=bottom_nav_kb())
+                return
             # Після збереження текстового повідомлення надішліть коротку підказку з клавіатурою
             # Користувач може додати ще повідомлення або натиснути «✅ Готово»
             await msg.answer('Можна додати ще повідомлення або натиснути «✅ Готово».', reply_markup=done_kb())
             return
-        await msg.answer('Надішліть текст або голосове, або натисніть «✅ Готово».', reply_markup=done_kb())
+        await msg.answer('Надішліть текстове або голосове повідомлення.', reply_markup=bottom_nav_kb())
         return
 
     # Якщо жодна з умов не спрацювала — користувач відійшов від сценарію
@@ -2591,7 +2612,11 @@ def np_detect_kind(s: str):
 @dp.callback_query(F.data == 'notes_yes')
 async def notes_yes_cb(q: CallbackQuery):
     st = state_by_chat.get(q.message.chat.id)
-    await _refresh_done_keyboard(q.message, '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nКоли завершите і дочекаєтесь <b>ПОВНОГО</b> завантаження -\nнатисніть «✅ Готово».')
+    await q.message.answer(
+        '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля першого збереженого повідомлення зʼявиться кнопка «✅ Готово».',
+        reply_markup=bottom_nav_kb(),
+        parse_mode='HTML'
+    )
     st.step = 'await_notes'
     await save_bot_state_async(q.message.chat.id, st)
     await q.answer()
@@ -2792,7 +2817,6 @@ async def email_done_cb(q: CallbackQuery):
     set_cell(st.sheet_row, 'status', 'files_expected')
     set_cell(st.sheet_row, 'email_sent', 'Yes')
     await ask_notes(q.message, st)
-    st.step = 'await_notes'
     await q.answer()
 
 # ==== Helpers added: _prompt_np_number and _show_np_saved_list ====
