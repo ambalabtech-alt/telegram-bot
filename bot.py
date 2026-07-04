@@ -60,6 +60,42 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials as UserCreds
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger('ambalab')
+
+DIAG_LOGS = os.getenv('DIAG_LOGS', '1') == '1'
+
+def diag_log(message: str, *args):
+    if DIAG_LOGS:
+        logger.info('[DIAG] ' + message, *args)
+
+class diag_timer:
+    def __init__(self, name: str, **ctx):
+        self.name = name
+        self.ctx = ctx
+        self.start = 0.0
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        diag_log('START %s ctx=%s', self.name, self.ctx)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        duration = time.perf_counter() - self.start
+        if duration >= 30:
+            level = 'VERY_SLOW'
+        elif duration >= 3:
+            level = 'SLOW'
+        else:
+            level = 'OK'
+        diag_log(
+            'END %s duration=%.3fs level=%s exc=%s ctx=%s',
+            self.name,
+            duration,
+            level,
+            exc_type.__name__ if exc_type else '',
+            self.ctx,
+        )
+        return False
+
 import html
 def _nonempty_text(s: str, min_len: int = 1) -> bool:
     return bool((s or '').strip()) and len((s or '').strip()) >= min_len
@@ -74,12 +110,13 @@ def _text_only(s: str, min_len: int = 1) -> bool:
     return re.fullmatch(r"[A-Za-zА-Яа-яЁёІіЇїЄє'’\- ]+", t) is not None
 
 async def _safe_append_row(values: Dict[str, str], msg) -> Optional[int]:
-    try:
-        return append_row(values)
-    except Exception:
-        logger.exception('Sheets append_row failed')
-        await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
-        return None
+    with diag_timer('safe_append_row', chat_id=getattr(getattr(msg, 'chat', None), 'id', None), order_id=values.get('order_id')):
+        try:
+            return append_row(values)
+        except Exception:
+            logger.exception('Sheets append_row failed')
+            await msg.answer("Тимчасові складності зі зв'язком. Спробуйте пізніше.")
+            return None
 
 async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str]) -> None:
     """
@@ -87,17 +124,20 @@ async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str])
     Робить кілька спроб, якщо Google Sheets тимчасово віддає SSL/мережеву помилку.
     """
     last_error = None
-    for attempt in range(3):
-        try:
-            # append_row синхронний — виконуємо у пулі потоків, щоб не блокувати event-loop
-            row = await asyncio.to_thread(append_row, values)
-            st.sheet_row = row
-            return
-        except Exception as e:
-            last_error = e
-            logger.exception('Sheets append_row failed (bg), attempt %s/3', attempt + 1)
-            if attempt < 2:
-                await asyncio.sleep(1 * (attempt + 1))
+    with diag_timer('append_row_bg.total', chat_id=getattr(msg.chat, 'id', None), order_id=getattr(st, 'order_id', None)):
+        for attempt in range(3):
+            try:
+                # append_row синхронний — виконуємо у пулі потоків, щоб не блокувати event-loop
+                with diag_timer('append_row_bg.attempt', attempt=attempt + 1, order_id=getattr(st, 'order_id', None)):
+                    row = await asyncio.to_thread(append_row, values)
+                st.sheet_row = row
+                diag_log('append_row_bg.row_ready chat=%s order=%s row=%s', msg.chat.id, getattr(st, 'order_id', None), row)
+                return
+            except Exception as e:
+                last_error = e
+                logger.exception('Sheets append_row failed (bg), attempt %s/3', attempt + 1)
+                if attempt < 2:
+                    await asyncio.sleep(1 * (attempt + 1))
 
     logger.error('Sheets append_row failed completely after retries: %s', last_error)
     # Не валимо діалог — просто делікатно повідомляємо
@@ -114,6 +154,14 @@ async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
     Запис відкладаємо і дозаписуємо, коли рядок стане доступним.
     """
     st = state_by_chat.get(msg.chat.id) if msg else None
+    diag_log(
+        'safe_set_cell.start chat=%s order=%s row=%s col=%s step=%s',
+        getattr(getattr(msg, 'chat', None), 'id', None),
+        getattr(st, 'order_id', None),
+        row,
+        col_name,
+        getattr(st, 'step', None),
+    )
     if not st:
         return True
 
@@ -123,6 +171,7 @@ async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
 
     # Якщо рядок ще не готовий - дочекаємось появи sheet_row (до ~5 секунд)
     if not row:
+        diag_log('safe_set_cell.wait_row chat=%s order=%s col=%s', msg.chat.id, getattr(st, 'order_id', None), col_name)
         for _ in range(10):  # 10 * 0.5s = 5s
             await asyncio.sleep(0.5)
             row = (getattr(st, 'sheet_row', 0) or 0)
@@ -131,22 +180,27 @@ async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
 
     # Якщо рядка досі немає - відкладаємо запис і йдемо далі
     if not row:
+        diag_log('safe_set_cell.defer_no_row chat=%s order=%s col=%s', msg.chat.id, getattr(st, 'order_id', None), col_name)
         st._pending_updates.append((col_name, value))
         return True
 
     # Перевіряємо, що поточний row досі належить цьому order_id
     try:
-        current_oid = (get_cell(row, 'order_id') or '').strip()
+        with diag_timer('safe_set_cell.verify_order_id', row=row, col=col_name, order_id=getattr(st, 'order_id', None)):
+            current_oid = (get_cell(row, 'order_id') or '').strip()
     except Exception:
         current_oid = ''
 
     if getattr(st, 'order_id', None) and current_oid != st.order_id:
-        new_row = find_row_by_order_id(st.order_id)
+        diag_log('safe_set_cell.row_mismatch chat=%s order=%s row=%s current_oid=%s col=%s', msg.chat.id, st.order_id, row, current_oid, col_name)
+        with diag_timer('safe_set_cell.find_correct_row', order_id=st.order_id, col=col_name):
+            new_row = find_row_by_order_id(st.order_id)
         if new_row:
             row = new_row
             st.sheet_row = new_row
         else:
             # Якщо не знайшли рядок - відкладаємо запис
+            diag_log('safe_set_cell.defer_missing_order chat=%s order=%s col=%s', msg.chat.id, st.order_id, col_name)
             st._pending_updates.append((col_name, value))
             return True
 
@@ -156,18 +210,21 @@ async def _safe_set_cell(row: int, col_name: str, value, msg) -> bool:
         st._pending_updates = []
         for c, v in pending:
             try:
-                set_cell(row, c, v)
+                with diag_timer('safe_set_cell.flush_pending', row=row, col=c, order_id=getattr(st, 'order_id', None)):
+                    set_cell(row, c, v)
             except Exception:
                 logger.exception("Sheets: deferred set_cell failed (%s)", c)
                 st._pending_updates.append((c, v))
 
     # Тепер пишемо поточне значення
     try:
-        set_cell(row, col_name, value)
+        with diag_timer('safe_set_cell.write_current', row=row, col=col_name, order_id=getattr(st, 'order_id', None)):
+            set_cell(row, col_name, value)
     except Exception:
         logger.exception('Sheets set_cell(%s) failed', col_name)
         st._pending_updates.append((col_name, value))
 
+    diag_log('safe_set_cell.end chat=%s order=%s row=%s col=%s', msg.chat.id, getattr(st, 'order_id', None), row, col_name)
     return True
 load_dotenv()
 BOOT_TS = int(time.time())
@@ -325,6 +382,11 @@ def warmup_doctor_phone_cache() -> None:
     Google Sheets on every order.  On any error, the cache is left empty.
     """
     global DOCTOR_PHONE_CACHE
+    with diag_timer('doctor_phone_cache.warmup'):
+        return _warmup_doctor_phone_cache_impl()
+
+def _warmup_doctor_phone_cache_impl() -> None:
+    global DOCTOR_PHONE_CACHE
     try:
         ws2 = np_profiles_ws()
         head = np_head(ws2)
@@ -354,7 +416,8 @@ def warmup_doctor_phone_cache() -> None:
 
 def get_headers_map(ws_, cache_key: str, force: bool = False) -> Dict[str, int]:
     if force or cache_key not in HEADERS_CACHE:
-        HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(_retry_sheets(ws_.row_values, 1))}
+        with diag_timer('sheets.headers_map.refresh', cache_key=cache_key, force=force):
+            HEADERS_CACHE[cache_key] = {name.strip(): idx + 1 for idx, name in enumerate(_retry_sheets(ws_.row_values, 1))}
     return HEADERS_CACHE[cache_key]
 
 def invalidate_headers_cache(cache_key: Optional[str] = None) -> None:
@@ -368,26 +431,31 @@ def headers_map(ws_) -> Dict[str, int]:
     return get_headers_map(ws_, cache_key)
 
 def set_cell(row: int, col_name: str, value):
-    col = headers_map(ws).get(col_name)
-    if not col:
-        logger.warning('Sheets: column %r not found', col_name)
-        return
-    _retry_sheets(ws.update_cell, row, col, str(value))
+    with diag_timer('sheets.set_cell', row=row, col=col_name):
+        col = headers_map(ws).get(col_name)
+        if not col:
+            logger.warning('Sheets: column %r not found', col_name)
+            return
+        _retry_sheets(ws.update_cell, row, col, str(value))
 
 def get_cell(row: int, col_name: str) -> str:
-    col = headers_map(ws).get(col_name)
-    if not col:
-        return ''
-    return _retry_sheets(ws.cell, row, col).value
+    with diag_timer('sheets.get_cell', row=row, col=col_name):
+        col = headers_map(ws).get(col_name)
+        if not col:
+            return ''
+        return _retry_sheets(ws.cell, row, col).value
 
 def find_row_by_order_id(order_id: str) -> int:
     """Знаходимо рядок замовлення СТРОГО по order_id (повний збіг) лише в колонці order_id.
 
     Оптимізація: використовуємо кеш (dict order_id -> row), щоб не читати колонку з Sheets на кожен запит.
     """
+    with diag_timer('sheets.find_row_by_order_id', order_id=order_id):
+        return _find_row_by_order_id_impl(order_id)
+
+def _find_row_by_order_id_impl(order_id: str) -> int:
     if not order_id:
         return 0
-
     head = headers_map(ws)
     col = head.get('order_id')
     if not col:
@@ -435,10 +503,13 @@ def append_row(values: Dict[str, str]) -> int:
     - never write outside A:AE;
     - never reuse empty-looking rows inside the existing table.
     """
+    with diag_timer('sheets.append_row', order_id=str(values.get('order_id') or '').strip()):
+        return _append_row_impl(values)
+
+def _append_row_impl(values: Dict[str, str]) -> int:
     head = headers_map(ws)
     header_values = _retry_sheets(ws.row_values, 1) or []
     header_values = list(header_values) + [''] * (31 - len(header_values))
-
     order_id = str(values.get('order_id') or '').strip()
     if not order_id:
         raise RuntimeError("append_row: order_id is required")
@@ -498,13 +569,16 @@ def _is_retryable_sheets_error(e: Exception) -> bool:
 
 def _retry_sheets(fn, *args, retries: int = 3, base_delay: float = 1.0, **kwargs):
     last = None
+    fn_name = getattr(fn, '__name__', repr(fn))
     for attempt in range(retries):
         try:
-            return fn(*args, **kwargs)
+            with diag_timer('sheets.call', fn=fn_name, attempt=attempt + 1, retries=retries):
+                return fn(*args, **kwargs)
         except Exception as e:
             last = e
             if attempt >= retries - 1 or not _is_retryable_sheets_error(e):
                 raise
+            diag_log('sheets.retry fn=%s attempt=%s/%s error=%r', fn_name, attempt + 1, retries, e)
             time.sleep(base_delay * (2 ** attempt))
     raise last
 
@@ -1671,18 +1745,20 @@ async def notify_admin_new_order(msg: Message, st: OrderState):
     )
 
     sent_chat_ids = set()
-    for chat_id in TECH_CHAT_IDS:
-        try:
-            if not chat_id:
-                continue
-            chat_id = int(chat_id)
-            if chat_id in sent_chat_ids:
-                logger.info('Tech notify skipped duplicate chat_id=%s for order=%s', chat_id, st.order_id)
-                continue
-            sent_chat_ids.add(chat_id)
-            await bot.send_message(chat_id, text, parse_mode='HTML')
-        except Exception as e:
-            logger.warning('Tech notify failed for %s: %s', chat_id, e)
+    with diag_timer('tech_notify.total', order_id=getattr(st, 'order_id', None), count=len(TECH_CHAT_IDS)):
+        for chat_id in TECH_CHAT_IDS:
+            try:
+                if not chat_id:
+                    continue
+                chat_id = int(chat_id)
+                if chat_id in sent_chat_ids:
+                    logger.info('Tech notify skipped duplicate chat_id=%s for order=%s', chat_id, st.order_id)
+                    continue
+                sent_chat_ids.add(chat_id)
+                with diag_timer('tech_notify.send_message', order_id=getattr(st, 'order_id', None), target_chat_id=chat_id):
+                    await bot.send_message(chat_id, text, parse_mode='HTML')
+            except Exception as e:
+                logger.warning('Tech notify failed for %s: %s', chat_id, e)
 
 @dp.message(CommandStart())
 async def start(msg: Message):
@@ -1744,44 +1820,61 @@ async def new_order(msg: Message):
     # this request.  Optionally we could remind the doctor that an order
     # is already in progress, but returning silently is sufficient to
     # avoid duplicate rows.
-    now_ts = time.time()
-    guard_entry = NEW_ORDER_GUARD.get(msg.chat.id)
-    if guard_entry:
-        guard_ts = guard_entry.get('ts') if isinstance(guard_entry, dict) else guard_entry
-        try:
-            elapsed = now_ts - float(guard_ts or 0)
-        except Exception:
-            elapsed = now_ts
-        if elapsed < NEW_ORDER_GUARD_SEC:
-            # A recent order exists; do not create a new one.
-            st_existing = state_by_chat.get(msg.chat.id)
-            if st_existing:
-                # Optionally reprompt the current step; here we simply return.
-                return
-    # Record the timestamp early to guard against race conditions
-    NEW_ORDER_GUARD[msg.chat.id] = {'ts': now_ts}
-    await _clear_inline_markup(msg)
-    await _silent_autostart_on_first_menu_click(msg)
-    st = OrderState()
-    st.order_id = gen_order_id()
-    st.email = LAB_EMAIL
-    st.accepted_files_count = 0
-    st.accepted_links_count = 0
-    st.accepted_notes_count = 0
-    state_by_chat[msg.chat.id] = st
-    await save_bot_state_async(msg.chat.id, st)
-    phone = doctor_phone_get(msg.chat.id)
-    base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
-    asyncio.create_task(_append_row_bg(msg, st, base_values))
-    
-    if not phone:
-        await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
-        st.step = 'doctor_phone'
+    with diag_timer('new_order.total', chat_id=msg.chat.id):
+        diag_log('new_order.start chat=%s', msg.chat.id)
+        now_ts = time.time()
+        guard_entry = NEW_ORDER_GUARD.get(msg.chat.id)
+        if guard_entry:
+            guard_ts = guard_entry.get('ts') if isinstance(guard_entry, dict) else guard_entry
+            try:
+                elapsed = now_ts - float(guard_ts or 0)
+            except Exception:
+                elapsed = now_ts
+            diag_log('new_order.guard_exists chat=%s elapsed=%.3fs', msg.chat.id, elapsed)
+            if elapsed < NEW_ORDER_GUARD_SEC:
+                # A recent order exists; do not create a new one.
+                st_existing = state_by_chat.get(msg.chat.id)
+                diag_log(
+                    'new_order.guard_hit chat=%s elapsed=%.3fs step=%s order=%s',
+                    msg.chat.id,
+                    elapsed,
+                    getattr(st_existing, 'step', None),
+                    getattr(st_existing, 'order_id', None),
+                )
+                if st_existing:
+                    # Optionally reprompt the current step; here we simply return.
+                    return
+        # Record the timestamp early to guard against race conditions
+        NEW_ORDER_GUARD[msg.chat.id] = {'ts': now_ts}
+        with diag_timer('new_order.clear_inline', chat_id=msg.chat.id):
+            await _clear_inline_markup(msg)
+        with diag_timer('new_order.silent_autostart', chat_id=msg.chat.id):
+            await _silent_autostart_on_first_menu_click(msg)
+        st = OrderState()
+        st.order_id = gen_order_id()
+        st.email = LAB_EMAIL
+        st.accepted_files_count = 0
+        st.accepted_links_count = 0
+        st.accepted_notes_count = 0
+        state_by_chat[msg.chat.id] = st
         await save_bot_state_async(msg.chat.id, st)
-    else:
-        await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
-        st.step = 'patient_lastname'
-        await save_bot_state_async(msg.chat.id, st)
+        with diag_timer('new_order.doctor_phone_get', chat_id=msg.chat.id, order_id=st.order_id):
+            phone = doctor_phone_get(msg.chat.id)
+        base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
+        diag_log('new_order.append_row_task_create chat=%s order=%s phone_cached=%s', msg.chat.id, st.order_id, bool(phone))
+        asyncio.create_task(_append_row_bg(msg, st, base_values))
+        
+        if not phone:
+            with diag_timer('new_order.answer_phone', chat_id=msg.chat.id, order_id=st.order_id):
+                await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
+            st.step = 'doctor_phone'
+            await save_bot_state_async(msg.chat.id, st)
+        else:
+            with diag_timer('new_order.answer_lastname', chat_id=msg.chat.id, order_id=st.order_id):
+                await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
+            st.step = 'patient_lastname'
+            await save_bot_state_async(msg.chat.id, st)
+        diag_log('new_order.end chat=%s order=%s step=%s', msg.chat.id, st.order_id, st.step)
 
 async def ask_notes(msg: Message, st: OrderState):
     # Reset the Done lock when entering the notes step so that the Done button
@@ -1792,8 +1885,10 @@ async def ask_notes(msg: Message, st: OrderState):
     await save_bot_state_async(msg.chat.id, st)
 
 async def finalize_order(msg: Message, st: OrderState):
+    diag_log('finalize.start chat=%s order=%s row=%s step=%s', msg.chat.id, getattr(st, 'order_id', None), getattr(st, 'sheet_row', None), getattr(st, 'step', None))
     # Prevent double-finalization
     if getattr(st, 'finalized', False):
+        diag_log('finalize.skip_already_finalized chat=%s order=%s', msg.chat.id, getattr(st, 'order_id', None))
         return
     st.finalized = True
 
@@ -1806,7 +1901,8 @@ async def finalize_order(msg: Message, st: OrderState):
         # Determine the current row by order_id
         current_row = 0
         try:
-            current_row = find_row_by_order_id(st.order_id)
+            with diag_timer('finalize.find_row', chat_id=msg.chat.id, order_id=st.order_id):
+                current_row = find_row_by_order_id(st.order_id)
         except Exception:
             current_row = 0
         if current_row:
@@ -1826,7 +1922,8 @@ async def finalize_order(msg: Message, st: OrderState):
             }
             # Append the new row synchronously to avoid interfering with finalization
             try:
-                new_row = append_row(base_values)
+                with diag_timer('finalize.append_replacement_row', chat_id=msg.chat.id, order_id=st.order_id):
+                    new_row = append_row(base_values)
                 st.sheet_row = new_row or st.sheet_row
             except Exception:
                 logger.exception('Failed to append replacement row for missing order')
@@ -1835,27 +1932,33 @@ async def finalize_order(msg: Message, st: OrderState):
             if row:
                 try:
                     if st.patient_lastname:
-                        set_cell(row, 'patient_lastname', st.patient_lastname)
+                        with diag_timer('finalize.restore.patient_lastname', row=row, order_id=st.order_id):
+                            set_cell(row, 'patient_lastname', st.patient_lastname)
                     if st.work_type:
-                        set_cell(row, 'work_type', st.work_type)
+                        with diag_timer('finalize.restore.work_type', row=row, order_id=st.order_id):
+                            set_cell(row, 'work_type', st.work_type)
                     if st.due_date_iso:
                         # Convert ISO date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) to dd.mm
                         try:
                             dt = datetime.fromisoformat(st.due_date_iso)
-                            set_cell(row, 'due_date', dt.strftime('%d.%m.%Y'))
+                            with diag_timer('finalize.restore.due_date', row=row, order_id=st.order_id):
+                                set_cell(row, 'due_date', dt.strftime('%d.%m.%Y'))
                         except Exception:
                             pass
                     # NP delivery refs if available
                     if getattr(st, 'np_city_ref', None):
-                        set_cell(row, 'np_city_ref', st.np_city_ref)
+                        with diag_timer('finalize.restore.np_city_ref', row=row, order_id=st.order_id):
+                            set_cell(row, 'np_city_ref', st.np_city_ref)
                     if getattr(st, 'np_warehouse_ref', None):
-                        set_cell(row, 'np_warehouse_ref', st.np_warehouse_ref)
+                        with diag_timer('finalize.restore.np_warehouse_ref', row=row, order_id=st.order_id):
+                            set_cell(row, 'np_warehouse_ref', st.np_warehouse_ref)
                 except Exception:
                     logger.exception('Failed to restore data to replacement row')
         # Set the final status
         if getattr(st, 'sheet_row', 0):
             try:
-                set_cell(st.sheet_row, 'status', 'order_submitted')
+                with diag_timer('finalize.set_status', row=st.sheet_row, order_id=st.order_id):
+                    set_cell(st.sheet_row, 'status', 'order_submitted')
             except Exception:
                 logger.exception('Failed to set final status')
     except Exception:
@@ -1864,22 +1967,34 @@ async def finalize_order(msg: Message, st: OrderState):
     # Notify technicians about the submitted order.
     # This was missing, so notify_admin_new_order existed but was never called.
     try:
-        await notify_admin_new_order(msg, st)
+        with diag_timer('finalize.notify_tech', chat_id=msg.chat.id, order_id=st.order_id):
+            await notify_admin_new_order(msg, st)
     except Exception:
         logger.exception('Failed to notify technicians about new order')
 
     # Send summary and reset state
     try:
-        await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
+        with diag_timer('finalize.answer_summary', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer(build_summary_text(st), parse_mode='HTML', reply_markup=main_kb())
     except Exception:
         logger.exception('Failed to send summary')
     # Reset state for this chat
     state_by_chat[msg.chat.id] = OrderState()
     await delete_bot_state_async(msg.chat.id)
+    diag_log('finalize.end chat=%s order=%s', msg.chat.id, getattr(st, 'order_id', None))
 
 @dp.message()
 async def flow(msg: Message):
     st = state_by_chat.get(msg.chat.id)
+    diag_log(
+        'flow.start chat=%s content=%s step=%s order=%s row=%s text_len=%s',
+        msg.chat.id,
+        msg.content_type,
+        getattr(st, 'step', None),
+        getattr(st, 'order_id', None),
+        getattr(st, 'sheet_row', None),
+        len((msg.text or '')),
+    )
     if not st:
         st = await load_bot_state_async(msg.chat.id)
         if st:
@@ -2278,25 +2393,34 @@ async def flow(msg: Message):
         return
     if st.step == 'patient_lastname':
         val = (msg.text or '').strip()
+        diag_log('lastname.start chat=%s order=%s row=%s step=%s text_len=%s', msg.chat.id, st.order_id, st.sheet_row, st.step, len(val))
         if not _text_only(val, min_len=2):
             await msg.answer('Поле не може бути порожнім. Вкажіть прізвище пацієнта текстом.')
             return
         st.patient_lastname = val
-        if not await _safe_set_cell(st.sheet_row, 'patient_lastname', st.patient_lastname, msg): return
-        await msg.answer('Який апарат замовляєте (сплінт, елайнери тощо):', reply_markup=bottom_nav_kb())
+        diag_log('lastname.state_saved chat=%s order=%s row=%s', msg.chat.id, st.order_id, st.sheet_row)
+        with diag_timer('lastname.safe_set_cell', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+            if not await _safe_set_cell(st.sheet_row, 'patient_lastname', st.patient_lastname, msg): return
+        with diag_timer('lastname.answer_work_type', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer('Який апарат замовляєте (сплінт, елайнери тощо):', reply_markup=bottom_nav_kb())
         st.step = 'work_type'
         await save_bot_state_async(msg.chat.id, st)
+        diag_log('lastname.end chat=%s order=%s row=%s next_step=%s', msg.chat.id, st.order_id, st.sheet_row, st.step)
         return
     if st.step == 'work_type':
         val = (msg.text or '').strip()
+        diag_log('work_type.start chat=%s order=%s row=%s step=%s text_len=%s', msg.chat.id, st.order_id, st.sheet_row, st.step, len(val))
         if not _text_only(val, min_len=2):
             await msg.answer('Для вводу використовуйте тільки літери.')
             return
         st.work_type = val
-        if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
-        await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
+        with diag_timer('work_type.safe_set_cell', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+            if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
+        with diag_timer('work_type.answer_due_date', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
         await save_bot_state_async(msg.chat.id, st)
+        diag_log('work_type.end chat=%s order=%s row=%s next_step=%s', msg.chat.id, st.order_id, st.sheet_row, st.step)
         return
     if st and st.step == 'due_date':
         d = parse_date_uk(msg.text or '')
@@ -2451,17 +2575,23 @@ async def flow(msg: Message):
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         return
     if st.step == 'await_links':
+        diag_log('await_links.start chat=%s order=%s row=%s text_len=%s done=%s', msg.chat.id, st.order_id, st.sheet_row, len(msg.text or ''), is_done_text(msg.text or ''))
         # If the user indicates they are done (via button or typed text), finish this step
         if is_done_text(msg.text or ''):
             if st.done_lock:
+                diag_log('await_links.done_locked chat=%s order=%s', msg.chat.id, st.order_id)
                 return
             st.done_lock = True
-            if st.accepted_links_count <= 0 and not st.pending_links and not (get_cell(st.sheet_row, 'links_external') or '').strip():
+            with diag_timer('await_links.done_check_existing_links', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                existing_links = (get_cell(st.sheet_row, 'links_external') or '').strip()
+            if st.accepted_links_count <= 0 and not st.pending_links and not existing_links:
                 await msg.answer('Поки що посилань не додано. Надішліть хоча б одне або оберіть інший спосіб.', reply_markup=files_aux_kb())
                 st.done_lock = False
                 return
-            set_cell(st.sheet_row, 'status', 'files_expected')
-            await ask_notes(msg, st)
+            with diag_timer('await_links.set_status_files_expected', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                set_cell(st.sheet_row, 'status', 'files_expected')
+            with diag_timer('await_links.ask_notes', chat_id=msg.chat.id, order_id=st.order_id):
+                await ask_notes(msg, st)
             st.done_lock = False
             return
         urls = extract_urls(msg.text or '')
@@ -2475,23 +2605,28 @@ async def flow(msg: Message):
                 st.accepted_links_count += 1
                 new_urls.append(u)
         async def _save_links_best_effort(urls_to_save: List[str], row_snapshot: int, order_id_snapshot: str):
-            try:
-                if urls_to_save:
-                    row = row_snapshot or getattr(st, 'sheet_row', 0)
-                    if not row:
-                        row = find_row_by_order_id(order_id_snapshot)
-                    if row:
-                        await asyncio.to_thread(update_joined, row, 'links_external', urls_to_save)
-                        await asyncio.to_thread(set_cell, row, 'status', 'files_received')
-            except Exception:
-                logger.exception('links best-effort save failed')
+            with diag_timer('await_links.bg_save.total', order_id=order_id_snapshot, row=row_snapshot, count=len(urls_to_save)):
+                try:
+                    if urls_to_save:
+                        row = row_snapshot or getattr(st, 'sheet_row', 0)
+                        if not row:
+                            with diag_timer('await_links.bg_save.find_row', order_id=order_id_snapshot):
+                                row = find_row_by_order_id(order_id_snapshot)
+                        if row:
+                            with diag_timer('await_links.bg_save.update_joined', order_id=order_id_snapshot, row=row):
+                                await asyncio.to_thread(update_joined, row, 'links_external', urls_to_save)
+                            with diag_timer('await_links.bg_save.set_status', order_id=order_id_snapshot, row=row):
+                                await asyncio.to_thread(set_cell, row, 'status', 'files_received')
+                except Exception:
+                    logger.exception('links best-effort save failed')
         row_snapshot = getattr(st, 'sheet_row', 0)
         order_id_snapshot = st.order_id
         # Save the new URLs in the background so we don't block the chat
         asyncio.create_task(_save_links_best_effort(new_urls, row_snapshot, order_id_snapshot))
         # Після відправлення посилання надішліть коротку підказку з клавіатурою
         # Це повідомлення піднімає кнопку «✅ Готово» без прихованих тригерів
-        await msg.answer('Можна надіслати ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
+        with diag_timer('await_links.answer_more', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer('Можна надіслати ще або натиснути «✅ Готово».', reply_markup=files_aux_kb())
         return
     if st.step == 'await_tele_files':
         if is_done_text(msg.text or ''):
@@ -2521,6 +2656,7 @@ async def flow(msg: Message):
         await handle_telegram_upload(msg, st, silent=False, is_tail=False)
         return
     if st.step == 'await_notes':
+        diag_log('await_notes.start chat=%s order=%s row=%s content=%s text_len=%s done=%s', msg.chat.id, st.order_id, st.sheet_row, msg.content_type, len(msg.text or ''), is_done_text(msg.text or ''))
         # If user typed Done or pressed the button
         if is_done_text(msg.text or ''):
             return await finalize_order(msg, st)
@@ -2528,28 +2664,34 @@ async def flow(msg: Message):
             file_id_tg = msg.voice.file_id
             st.accepted_notes_count += 1
             async def _save_voice_best_effort():
-                try:
-                    file = await bot.get_file(file_id_tg)
-                    buf = await bot.download_file(file.file_path)
-                    if hasattr(buf, 'read'):
-                        data = buf.read()
-                    elif isinstance(buf, (bytes, bytearray)):
-                        data = bytes(buf)
-                    else:
-                        import io
-                        bio = io.BytesIO()
-                        await bot.download_file(file.file_path, destination=bio)
-                        bio.seek(0)
-                        data = bio.getvalue()
-                    fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
-                    _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
-                    prev_link = get_cell(st.sheet_row, 'voice_link')
-                    set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
-                except Exception:
-                    logger.exception('Voice upload error')
+                with diag_timer('await_notes.voice.bg_save.total', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                    try:
+                        with diag_timer('await_notes.voice.get_file', chat_id=msg.chat.id, order_id=st.order_id):
+                            file = await bot.get_file(file_id_tg)
+                        with diag_timer('await_notes.voice.download_file', chat_id=msg.chat.id, order_id=st.order_id):
+                            buf = await bot.download_file(file.file_path)
+                        if hasattr(buf, 'read'):
+                            data = buf.read()
+                        elif isinstance(buf, (bytes, bytearray)):
+                            data = bytes(buf)
+                        else:
+                            import io
+                            bio = io.BytesIO()
+                            await bot.download_file(file.file_path, destination=bio)
+                            bio.seek(0)
+                            data = bio.getvalue()
+                        fname = f"voice_{nz(st.order_id)}_{datetime.now().strftime('%H%M%S')}.ogg"
+                        with diag_timer('await_notes.voice.upload_to_drive', chat_id=msg.chat.id, order_id=st.order_id):
+                            _, vlink = await upload_to_drive(st, fname, data, 'audio/ogg')
+                        with diag_timer('await_notes.voice.save_link', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                            prev_link = get_cell(st.sheet_row, 'voice_link')
+                            set_cell(st.sheet_row, 'voice_link', (prev_link + ' ' if prev_link else '') + vlink)
+                    except Exception:
+                        logger.exception('Voice upload error')
             try:
-                prev = await asyncio.to_thread(get_cell, st.sheet_row, 'voice_id')
-                await asyncio.to_thread(set_cell, st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
+                with diag_timer('await_notes.voice.save_voice_id', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                    prev = await asyncio.to_thread(get_cell, st.sheet_row, 'voice_id')
+                    await asyncio.to_thread(set_cell, st.sheet_row, 'voice_id', (prev + ' ' if prev else '') + file_id_tg)
             except Exception:
                 logger.exception('voice_id save failed')
                 await msg.answer('Не вдалося зберегти голосове повідомлення. Спробуйте надіслати ще раз.', reply_markup=bottom_nav_kb())
@@ -2557,27 +2699,31 @@ async def flow(msg: Message):
             asyncio.create_task(_save_voice_best_effort())
             # Після збереження голосового повідомлення надішліть коротку підказку з клавіатурою
             # Користувач може додати ще повідомлення або натиснути «✅ Готово»
-            await msg.answer('Можна додати ще повідомлення або натиснути «✅ Готово».', reply_markup=done_kb())
+            with diag_timer('await_notes.voice.answer_more', chat_id=msg.chat.id, order_id=st.order_id):
+                await msg.answer('Можна додати ще повідомлення або натиснути «✅ Готово».', reply_markup=done_kb())
             return
         if msg.text:
             st.accepted_notes_count += 1
             note_text = (msg.text or '')
             async def _save_note_best_effort():
-                try:
-                    prev = get_cell(st.sheet_row, 'notes')
-                    set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
-                except Exception:
-                    logger.exception('notes best-effort save failed')
+                with diag_timer('await_notes.text.bg_save.total', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                    try:
+                        prev = get_cell(st.sheet_row, 'notes')
+                        set_cell(st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
+                    except Exception:
+                        logger.exception('notes best-effort save failed')
             try:
-                prev = await asyncio.to_thread(get_cell, st.sheet_row, 'notes')
-                await asyncio.to_thread(set_cell, st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
+                with diag_timer('await_notes.text.save_note', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
+                    prev = await asyncio.to_thread(get_cell, st.sheet_row, 'notes')
+                    await asyncio.to_thread(set_cell, st.sheet_row, 'notes', (prev + '\n' if prev else '') + note_text)
             except Exception:
                 logger.exception('notes save failed')
                 await msg.answer('Не вдалося зберегти повідомлення. Спробуйте надіслати ще раз.', reply_markup=bottom_nav_kb())
                 return
             # Після збереження текстового повідомлення надішліть коротку підказку з клавіатурою
             # Користувач може додати ще повідомлення або натиснути «✅ Готово»
-            await msg.answer('Можна додати ще повідомлення або натиснути «✅ Готово».', reply_markup=done_kb())
+            with diag_timer('await_notes.text.answer_more', chat_id=msg.chat.id, order_id=st.order_id):
+                await msg.answer('Можна додати ще повідомлення або натиснути «✅ Готово».', reply_markup=done_kb())
             return
         await msg.answer('Надішліть текстове або голосове повідомлення.', reply_markup=bottom_nav_kb())
         return
