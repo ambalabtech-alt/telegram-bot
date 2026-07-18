@@ -47,10 +47,6 @@ async def _clear_inline_markup(msg: Message) -> None:
             except Exception:
                 pass
         st.last_inline_msg_id = None
-    try:
-        await msg.bot.edit_message_reply_markup(chat_id=msg.chat.id, message_id=msg.message_id, reply_markup=None)
-    except Exception:
-        pass
 import aiohttp
 import gspread
 from googleapiclient.discovery import build
@@ -2201,7 +2197,6 @@ async def flow(msg: Message):
                 await _clear_inline_markup(msg)
                 await msg.answer(hint, reply_markup=np_menu_kb(has_saved))
             elif prev_step == 'choose_files_method':
-                await _clear_inline_markup(msg)
                 await msg.answer(hint, reply_markup=files_method_kb())
             else:
                 await msg.answer(hint, parse_mode='HTML', reply_markup=bottom_nav_kb())
@@ -2275,7 +2270,6 @@ async def flow(msg: Message):
             st.step = 'choose_files_method'
             st.upload_ui_closed = True
             st.upload_step_token = int(getattr(st, 'upload_step_token', 0) or 0) + 1
-            await _clear_inline_markup(msg)
             await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             return
     allowed_done_states = {'await_tele_files', 'await_links', 'email_wait_done', 'await_notes', 'await_notes_choice'}
@@ -2490,7 +2484,6 @@ async def flow(msg: Message):
             return
 
         profiles = np_profiles_list(msg.chat.id)
-        await _clear_inline_markup(msg)
         await msg.answer(
             'Доставити замовлення Новою Поштою. Оберіть пункт меню:',
             reply_markup=np_menu_kb(has_saved=bool(profiles))
@@ -2618,8 +2611,6 @@ async def flow(msg: Message):
             append_files_method(st.sheet_row, 'Imprint')
             await ask_notes(msg, st)
             return
-        await _clear_inline_markup(msg)
-        await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
         return
     if st.step == 'await_links':
