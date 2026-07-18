@@ -132,6 +132,12 @@ async def _append_row_bg(msg: Message, st: "OrderState", values: Dict[str, str])
                     row = await asyncio.to_thread(append_row, values)
                 st.sheet_row = row
                 diag_log('append_row_bg.row_ready chat=%s order=%s row=%s', msg.chat.id, getattr(st, 'order_id', None), row)
+                if getattr(st, 'start_failed', False):
+                    try:
+                        await asyncio.to_thread(set_cell, row, 'status', 'cancelled')
+                        diag_log('append_row_bg.cancelled_failed_start chat=%s order=%s row=%s', msg.chat.id, getattr(st, 'order_id', None), row)
+                    except Exception:
+                        logger.exception('Failed to cancel row after first-prompt failure (row=%s, order=%s)', row, getattr(st, 'order_id', None))
                 return
             except Exception as e:
                 last_error = e
@@ -353,37 +359,24 @@ HEADERS_CACHE: Dict[str, Dict[str, int]] = {}
 # оновлюється при додаванні/оновленні адрес через np_profile_upsert().
 NP_PROFILES_CACHE: Dict[str, List[dict]] = {}
 
-# Guard only protects the short moment while the "Зробити замовлення" handler
-# is creating the next order state and sending the first prompt. It must be
-# cleared as soon as the order flow moves forward.
-NEW_ORDER_GUARD: Dict[int, dict] = {}
-NEW_ORDER_GUARD_SEC: int = 60
+# Counts presses of the main-menu button "Зробити замовлення".
+# The first press starts an order. Further presses are ignored until the bot
+# returns this chat to the main menu or the first prompt fails to send.
+NEW_ORDER_CLICK_COUNT: Dict[int, int] = {}
 
-def _has_active_order(st) -> bool:
-    return bool(st and getattr(st, 'order_id', '') and not getattr(st, 'finalized', False))
-
-def _set_new_order_guard(chat_id: int, order_id: str = '') -> None:
-    NEW_ORDER_GUARD[chat_id] = {'ts': time.time(), 'order_id': order_id, 'phase': 'starting'}
-    diag_log('new_order.guard_set chat=%s order=%s', chat_id, order_id)
-
-def _clear_new_order_guard(chat_id: int, reason: str) -> None:
-    old = NEW_ORDER_GUARD.pop(chat_id, None)
-    if old is not None:
-        diag_log('new_order.guard_clear chat=%s reason=%s old=%s', chat_id, reason, old)
-
-def _new_order_guard_is_active(chat_id: int) -> bool:
-    guard = NEW_ORDER_GUARD.get(chat_id)
-    if not guard:
+def _register_new_order_click(chat_id: int) -> bool:
+    count = int(NEW_ORDER_CLICK_COUNT.get(chat_id, 0) or 0) + 1
+    NEW_ORDER_CLICK_COUNT[chat_id] = count
+    if count > 1:
+        diag_log('new_order.click_ignored chat=%s count=%s', chat_id, count)
         return False
-    try:
-        elapsed = time.time() - float(guard.get('ts') or 0)
-    except Exception:
-        elapsed = NEW_ORDER_GUARD_SEC + 1
-    if elapsed >= NEW_ORDER_GUARD_SEC:
-        _clear_new_order_guard(chat_id, 'expired')
-        return False
-    diag_log('new_order.guard_hit chat=%s elapsed=%.3fs guard=%s', chat_id, elapsed, guard)
+    diag_log('new_order.click_first chat=%s', chat_id)
     return True
+
+def _reset_new_order_click_count(chat_id: int, reason: str) -> None:
+    old = NEW_ORDER_CLICK_COUNT.pop(chat_id, None)
+    if old is not None:
+        diag_log('new_order.click_reset chat=%s reason=%s old=%s', chat_id, reason, old)
 
 #
 # A simple in-memory cache for mapping Telegram chat IDs to the doctor's phone
@@ -1039,6 +1032,7 @@ class OrderState:
     accepted_notes_count: int = 0
     pending_links: List[str] = field(default_factory=list)
     finalized: bool = False
+    start_failed: bool = False
 state_by_chat: Dict[int, OrderState] = {}
 
 # =============================================================================
@@ -1423,7 +1417,7 @@ async def _warn_or_reset_to_menu(msg: Message, st: "OrderState") -> bool:
         await msg.answer("Бачу, що ми відхиляємось від сценарію. Повертаю у Головне меню.", reply_markup=main_kb())
         state_by_chat[msg.chat.id] = OrderState()
         await delete_bot_state_async(msg.chat.id)
-        _clear_new_order_guard(msg.chat.id, 'reset_to_menu_offtopic')
+        _reset_new_order_click_count(msg.chat.id, 'reset_to_menu_offtopic')
         return True
     await msg.answer("Будь ласка, притримуйтесь сценарію оформлення замовлення.", reply_markup=bottom_nav_kb())
     return True
@@ -1481,7 +1475,7 @@ def _cancel_and_to_menu(msg: Message):
         except Exception:
             pass
     state_by_chat[msg.chat.id] = OrderState()
-    _clear_new_order_guard(msg.chat.id, 'cancel_and_to_menu')
+    _reset_new_order_click_count(msg.chat.id, 'cancel_and_to_menu')
 
 def _prev_step(st: OrderState) -> tuple[str, str]:
     sname = st.step or ''
@@ -1791,13 +1785,13 @@ async def start(msg: Message):
     await _clear_inline_markup(msg)
     state_by_chat[msg.chat.id] = OrderState()
     await delete_bot_state_async(msg.chat.id)
-    _clear_new_order_guard(msg.chat.id, 'start_command')
+    _reset_new_order_click_count(msg.chat.id, 'start_command')
     await msg.answer('Вітаємо! Це бот AmbaLab. Натисніть «🧾 Зробити замовлення», щоб розпочати.', reply_markup=main_kb())
 
 @dp.message(F.text == '/menu')
 async def menu_cmd(msg: Message):
     await _clear_inline_markup(msg)
-    _clear_new_order_guard(msg.chat.id, 'menu_command')
+    _reset_new_order_click_count(msg.chat.id, 'menu_command')
     state_by_chat[msg.chat.id] = state_by_chat.get(msg.chat.id, OrderState())
     await save_bot_state_async(msg.chat.id, state_by_chat[msg.chat.id])
     await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
@@ -1836,57 +1830,92 @@ async def contact_tech(msg: Message):
             )
     except Exception as e:
         logger.warning('Cannot ping work contact: %s', e)
+    _reset_new_order_click_count(msg.chat.id, 'contact_tech_main_menu')
     await msg.answer("Передали повідомлення техніку. Він зв'яжеться з Вами найближчим часом.", reply_markup=main_kb())
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
     with diag_timer('new_order.total', chat_id=msg.chat.id):
         diag_log('new_order.start chat=%s', msg.chat.id)
-        if _new_order_guard_is_active(msg.chat.id):
+
+        # Only the first press from the current main-menu cycle may start an order.
+        # A delayed duplicate press is ignored even if it reaches the handler
+        # after the first prompt has already been sent.
+        if not _register_new_order_click(msg.chat.id):
             return
 
-        st_existing = state_by_chat.get(msg.chat.id)
-        if _has_active_order(st_existing):
-            diag_log(
-                'new_order.active_order_exists chat=%s step=%s order=%s',
-                msg.chat.id,
-                getattr(st_existing, 'step', None),
-                getattr(st_existing, 'order_id', None),
-            )
-            return
+        st = None
+        try:
+            with diag_timer('new_order.clear_inline', chat_id=msg.chat.id):
+                await _clear_inline_markup(msg)
+            with diag_timer('new_order.silent_autostart', chat_id=msg.chat.id):
+                await _silent_autostart_on_first_menu_click(msg)
 
-        _set_new_order_guard(msg.chat.id)
-        with diag_timer('new_order.clear_inline', chat_id=msg.chat.id):
-            await _clear_inline_markup(msg)
-        with diag_timer('new_order.silent_autostart', chat_id=msg.chat.id):
-            await _silent_autostart_on_first_menu_click(msg)
-        st = OrderState()
-        st.order_id = gen_order_id()
-        _set_new_order_guard(msg.chat.id, st.order_id)
-        st.email = LAB_EMAIL
-        st.accepted_files_count = 0
-        st.accepted_links_count = 0
-        st.accepted_notes_count = 0
-        state_by_chat[msg.chat.id] = st
-        await save_bot_state_async(msg.chat.id, st)
-        with diag_timer('new_order.doctor_phone_get', chat_id=msg.chat.id, order_id=st.order_id):
-            phone = doctor_phone_get(msg.chat.id)
-        base_values = {'order_id': st.order_id, 'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'), 'doctor_name': msg.from_user.full_name if msg.from_user else '', 'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '', 'chat_id': str(msg.chat.id), 'phone': phone, 'status': 'new'}
-        diag_log('new_order.append_row_task_create chat=%s order=%s phone_cached=%s', msg.chat.id, st.order_id, bool(phone))
-        asyncio.create_task(_append_row_bg(msg, st, base_values))
-        
-        if not phone:
-            with diag_timer('new_order.answer_phone', chat_id=msg.chat.id, order_id=st.order_id):
-                await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
-            st.step = 'doctor_phone'
+            st = OrderState()
+            st.order_id = gen_order_id()
+            st.email = LAB_EMAIL
+            st.accepted_files_count = 0
+            st.accepted_links_count = 0
+            st.accepted_notes_count = 0
+            state_by_chat[msg.chat.id] = st
             await save_bot_state_async(msg.chat.id, st)
-        else:
-            with diag_timer('new_order.answer_lastname', chat_id=msg.chat.id, order_id=st.order_id):
-                await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
-            st.step = 'patient_lastname'
+
+            with diag_timer('new_order.doctor_phone_get', chat_id=msg.chat.id, order_id=st.order_id):
+                phone = doctor_phone_get(msg.chat.id)
+
+            base_values = {
+                'order_id': st.order_id,
+                'created_at': now_kyiv().strftime('%d.%m.%Y %H:%M:%S'),
+                'doctor_name': msg.from_user.full_name if msg.from_user else '',
+                'tg_username': f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else '',
+                'chat_id': str(msg.chat.id),
+                'phone': phone,
+                'status': 'new',
+            }
+            diag_log('new_order.append_row_task_create chat=%s order=%s phone_cached=%s', msg.chat.id, st.order_id, bool(phone))
+            asyncio.create_task(_append_row_bg(msg, st, base_values))
+
+            if not phone:
+                with diag_timer('new_order.answer_phone', chat_id=msg.chat.id, order_id=st.order_id):
+                    await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
+                st.step = 'doctor_phone'
+            else:
+                with diag_timer('new_order.answer_lastname', chat_id=msg.chat.id, order_id=st.order_id):
+                    await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
+                st.step = 'patient_lastname'
+
             await save_bot_state_async(msg.chat.id, st)
-        _clear_new_order_guard(msg.chat.id, 'first_prompt_sent')
-        diag_log('new_order.end chat=%s order=%s step=%s', msg.chat.id, st.order_id, st.step)
+            diag_log('new_order.end chat=%s order=%s step=%s', msg.chat.id, st.order_id, st.step)
+
+        except Exception:
+            logger.exception('New order failed before the first prompt (chat=%s, order=%s)', msg.chat.id, getattr(st, 'order_id', None))
+
+            # The background append may already have created the row or may do
+            # so a little later. In both cases it must become cancelled.
+            if st is not None:
+                st.start_failed = True
+                row = int(getattr(st, 'sheet_row', 0) or 0)
+                if row:
+                    try:
+                        await asyncio.to_thread(set_cell, row, 'status', 'cancelled')
+                    except Exception:
+                        logger.exception('Failed to cancel row after first-prompt failure (row=%s, order=%s)', row, getattr(st, 'order_id', None))
+
+            state_by_chat[msg.chat.id] = OrderState()
+            await delete_bot_state_async(msg.chat.id)
+            _reset_new_order_click_count(msg.chat.id, 'first_prompt_failed')
+
+            # Show a fresh, explicit main menu. If Telegram is still unavailable,
+            # state and click counter are already clean, so the old visible button
+            # will work on the next press.
+            try:
+                await msg.answer(
+                    'Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».',
+                    reply_markup=main_kb(),
+                )
+            except Exception:
+                logger.exception('Failed to show main menu after first-prompt failure (chat=%s)', msg.chat.id)
+            return
 
 async def ask_notes(msg: Message, st: OrderState):
     # Reset the Done lock when entering the notes step so that the Done button
@@ -1993,7 +2022,7 @@ async def finalize_order(msg: Message, st: OrderState):
     # Reset state for this chat
     state_by_chat[msg.chat.id] = OrderState()
     await delete_bot_state_async(msg.chat.id)
-    _clear_new_order_guard(msg.chat.id, 'finalize')
+    _reset_new_order_click_count(msg.chat.id, 'finalize')
     diag_log('finalize.end chat=%s order=%s', msg.chat.id, getattr(st, 'order_id', None))
 
 @dp.message()
@@ -2050,7 +2079,7 @@ async def flow(msg: Message):
                             # Нічого не пишемо в таблицю і не повідомляємо про скасування.
                             state_by_chat[msg.chat.id] = OrderState()
                             await delete_bot_state_async(msg.chat.id)
-                            _clear_new_order_guard(msg.chat.id, 'old_unfinished_reset')
+                            _reset_new_order_click_count(msg.chat.id, 'old_unfinished_reset')
                             await msg.answer(
                                 'Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».',
                                 reply_markup=main_kb()
@@ -2079,7 +2108,7 @@ async def flow(msg: Message):
                 await msg.answer('Повертаємось у Головне меню. Спробуйте ще раз.', reply_markup=main_kb())
                 state_by_chat[msg.chat.id] = OrderState()
                 await delete_bot_state_async(msg.chat.id)
-                _clear_new_order_guard(msg.chat.id, 'url_outside_flow_reset')
+                _reset_new_order_click_count(msg.chat.id, 'url_outside_flow_reset')
                 return
     # Відновлення стану для файлів після рестарту/втрати памʼяті.
     # Якщо лікар надсилає документ або фото, але бот не памʼятає крок,
@@ -2131,7 +2160,7 @@ async def flow(msg: Message):
             await msg.answer('Повертаємось у Головне меню. Спробуйте ще раз.', reply_markup=main_kb())
             state_by_chat[msg.chat.id] = OrderState()
             await delete_bot_state_async(msg.chat.id)
-            _clear_new_order_guard(msg.chat.id, 'unexpected_content_reset')
+            _reset_new_order_click_count(msg.chat.id, 'unexpected_content_reset')
             return
     st = state_by_chat.get(msg.chat.id)
     await _clear_inline_markup(msg)
@@ -2147,6 +2176,7 @@ async def flow(msg: Message):
             await msg.answer('Повернулись до вибору способу передачі файлів:', reply_markup=files_method_kb())
             return
         if not st:
+            _reset_new_order_click_count(msg.chat.id, 'back_without_state_main_menu')
             await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
             return
         if st and st.delivery_step == 'saved_pick':
@@ -2190,7 +2220,7 @@ async def flow(msg: Message):
                     pass
             state_by_chat[msg.chat.id] = OrderState()
             await delete_bot_state_async(msg.chat.id)
-            _clear_new_order_guard(msg.chat.id, 'user_cancel_to_menu')
+            _reset_new_order_click_count(msg.chat.id, 'user_cancel_to_menu')
             await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
             return
         if text == 'Ні, продовжити':
@@ -2255,7 +2285,7 @@ async def flow(msg: Message):
         return
     if not st:
         state_by_chat[msg.chat.id] = OrderState()
-        _clear_new_order_guard(msg.chat.id, 'no_state_main_menu')
+        _reset_new_order_click_count(msg.chat.id, 'no_state_main_menu')
         return await msg.answer('Готові прийняти замовлення. Натисніть «🧾 Зробити замовлення».', reply_markup=main_kb())
     if st and st.step == 'await_notes_choice':
         choice = (msg.text or '').strip()
@@ -3191,7 +3221,7 @@ async def _cancel_yesterdays_unfinished_orders():
                 # 3) скинути локальний стан
                 try:
                     state_by_chat[chat_id] = OrderState()
-                    _clear_new_order_guard(chat_id, 'auto_cancel_scheduler')
+                    _reset_new_order_click_count(chat_id, 'auto_cancel_scheduler')
                 except Exception:
                     pass
 
