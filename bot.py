@@ -1746,7 +1746,594 @@ def build_summary_text(st: OrderState) -> str:
 
     return base_text
 
-bot = Bot(BOT_TOKEN)
+# =============================================================================
+# Telegram transport diagnostics
+#
+# This section is intentionally diagnostic-only:
+# - it does not change aiogram's default request timeout;
+# - it does not retry or duplicate Telegram API calls;
+# - it does not change the order state machine;
+# - it never logs the bot token, message text, request body, or file contents.
+# =============================================================================
+import contextvars
+import socket
+import ssl
+import uuid
+from collections import Counter
+from types import SimpleNamespace
+
+from aiohttp import ClientSession, TraceConfig
+from aiohttp.hdrs import USER_AGENT
+from aiohttp.http import SERVER_SOFTWARE
+from aiogram.__meta__ import __version__ as AIOGRAM_VERSION
+from aiogram.client.session.aiohttp import AiohttpSession
+
+TG_DIAG_ENABLED = os.getenv('TG_DIAG_ENABLED', '1') == '1'
+TG_DIAG_LOOP_LAG_WARN_SEC = float(os.getenv('TG_DIAG_LOOP_LAG_WARN_SEC', '0.50'))
+TG_DIAG_PROBE_TIMEOUT_SEC = float(os.getenv('TG_DIAG_PROBE_TIMEOUT_SEC', '5.0'))
+TG_DIAG_WATCH_THRESHOLDS = (3.0, 10.0, 30.0, 55.0)
+
+_TG_REQUEST_ID = contextvars.ContextVar('tg_request_id', default='')
+_TG_ACTIVE_REQUESTS: Dict[str, dict] = {}
+_TG_EVENT_LOOP_MONITOR_TASK: Optional[asyncio.Task] = None
+_TG_LAST_EVENT_LOOP_LAG = 0.0
+_TG_LAST_EVENT_LOOP_LAG_TS = 0.0
+
+
+def _tg_new_request_id() -> str:
+    return 'tg-' + uuid.uuid4().hex[:10]
+
+
+def _tg_safe_error_text(value) -> str:
+    """Return a compact error string with the bot token and Bot API URL removed."""
+    text = str(value or '')
+    token = str(BOT_TOKEN or '')
+    if token:
+        text = text.replace(token, '<BOT_TOKEN>')
+    text = re.sub(r'/bot[^/\s]+/', '/bot<BOT_TOKEN>/', text)
+    text = re.sub(r'https://api\.telegram\.org/[^\s]+', 'https://api.telegram.org/<redacted>', text)
+    return text[:500]
+
+
+def _tg_method_name(method) -> str:
+    return str(getattr(method, '__api_method__', '') or type(method).__name__)
+
+
+def _tg_extract_chat_id(method):
+    value = getattr(method, 'chat_id', None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return str(value)[:80]
+
+
+def _tg_order_context(chat_id) -> Tuple[str, str]:
+    try:
+        if isinstance(chat_id, int):
+            st = state_by_chat.get(chat_id)
+            if st:
+                return str(getattr(st, 'order_id', '') or ''), str(getattr(st, 'step', '') or '')
+    except Exception:
+        pass
+    return '', ''
+
+
+def _tg_inflight_snapshot() -> dict:
+    counts = Counter(str(r.get('method') or '') for r in _TG_ACTIVE_REQUESTS.values())
+    oldest_age = 0.0
+    now = time.monotonic()
+    if _TG_ACTIVE_REQUESTS:
+        oldest_age = max(now - float(r.get('started', now)) for r in _TG_ACTIVE_REQUESTS.values())
+    return {
+        'total': len(_TG_ACTIVE_REQUESTS),
+        'sendMessage': counts.get('sendMessage', 0),
+        'sendDocument': counts.get('sendDocument', 0),
+        'sendPhoto': counts.get('sendPhoto', 0),
+        'editMessageReplyMarkup': counts.get('editMessageReplyMarkup', 0),
+        'getUpdates': counts.get('getUpdates', 0),
+        'oldest_age': oldest_age,
+    }
+
+
+def _tg_task_stack(task: Optional[asyncio.Task], limit: int = 10) -> str:
+    if task is None:
+        return ''
+    try:
+        frames = task.get_stack(limit=limit)
+    except Exception:
+        return ''
+    parts = []
+    for frame in frames:
+        code = frame.f_code
+        parts.append(f'{os.path.basename(code.co_filename)}:{frame.f_lineno}:{code.co_name}')
+    return ' <- '.join(parts[-limit:])
+
+
+def _tg_process_snapshot() -> dict:
+    try:
+        fd_count = len(os.listdir('/proc/self/fd'))
+    except Exception:
+        fd_count = -1
+    try:
+        task_count = len(asyncio.all_tasks())
+    except Exception:
+        task_count = -1
+    rss_kb = -1
+    try:
+        import resource
+        rss_kb = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        pass
+    return {
+        'asyncio_tasks': task_count,
+        'threads': threading.active_count(),
+        'open_fds': fd_count,
+        'rss_kb': rss_kb,
+    }
+
+
+async def _tg_network_probe(request_id: str, reason_age: float) -> None:
+    """Independent DNS + TCP/TLS + HTTPS probe without bot token or Bot API method."""
+    if not TG_DIAG_ENABLED:
+        return
+    host = 'api.telegram.org'
+    loop = asyncio.get_running_loop()
+    started = time.monotonic()
+    addresses = []
+    try:
+        dns_started = time.monotonic()
+        result = await asyncio.wait_for(
+            loop.getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+            timeout=TG_DIAG_PROBE_TIMEOUT_SEC,
+        )
+        dns_duration = time.monotonic() - dns_started
+        addresses = sorted({str(item[4][0]) for item in result if item and len(item) >= 5})[:8]
+        diag_log(
+            'TG_PROBE DNS_OK id=%s trigger_age=%.1fs duration=%.3fs addresses=%s',
+            request_id,
+            reason_age,
+            dns_duration,
+            addresses,
+        )
+    except Exception as exc:
+        diag_log(
+            'TG_PROBE DNS_ERROR id=%s trigger_age=%.1fs duration=%.3fs exc=%s error=%s',
+            request_id,
+            reason_age,
+            time.monotonic() - started,
+            type(exc).__name__,
+            _tg_safe_error_text(exc),
+        )
+        return
+
+    writer = None
+    try:
+        connect_started = time.monotonic()
+        ssl_ctx = ssl.create_default_context()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, 443, ssl=ssl_ctx, server_hostname=host),
+            timeout=TG_DIAG_PROBE_TIMEOUT_SEC,
+        )
+        connect_duration = time.monotonic() - connect_started
+        peer = writer.get_extra_info('peername')
+        ssl_obj = writer.get_extra_info('ssl_object')
+        tls_version = ssl_obj.version() if ssl_obj else ''
+        diag_log(
+            'TG_PROBE TCP_TLS_OK id=%s trigger_age=%.1fs duration=%.3fs peer=%s tls=%s',
+            request_id,
+            reason_age,
+            connect_duration,
+            peer,
+            tls_version,
+        )
+
+        https_started = time.monotonic()
+        writer.write(
+            b'GET / HTTP/1.1\r\n'
+            b'Host: api.telegram.org\r\n'
+            b'User-Agent: AmbaLab-TG-Diagnostics/1\r\n'
+            b'Connection: close\r\n\r\n'
+        )
+        await asyncio.wait_for(writer.drain(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC)
+        status_line = await asyncio.wait_for(reader.readline(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC)
+        diag_log(
+            'TG_PROBE HTTPS_OK id=%s trigger_age=%.1fs duration=%.3fs status_line=%s total=%.3fs',
+            request_id,
+            reason_age,
+            time.monotonic() - https_started,
+            status_line.decode('ascii', errors='replace').strip()[:120],
+            time.monotonic() - started,
+        )
+    except Exception as exc:
+        diag_log(
+            'TG_PROBE CONNECT_OR_HTTPS_ERROR id=%s trigger_age=%.1fs total=%.3fs exc=%s error=%s addresses=%s',
+            request_id,
+            reason_age,
+            time.monotonic() - started,
+            type(exc).__name__,
+            _tg_safe_error_text(exc),
+            addresses,
+        )
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def _tg_event_loop_monitor() -> None:
+    """Log only abnormal asyncio scheduling delays and attach them to active requests."""
+    global _TG_LAST_EVENT_LOOP_LAG, _TG_LAST_EVENT_LOOP_LAG_TS
+    interval = 1.0
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + interval
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            now = loop.time()
+            lag = max(0.0, now - expected)
+            expected = now + interval
+            _TG_LAST_EVENT_LOOP_LAG = lag
+            _TG_LAST_EVENT_LOOP_LAG_TS = time.monotonic()
+            if lag > 0:
+                for rec in list(_TG_ACTIVE_REQUESTS.values()):
+                    rec['max_event_loop_lag'] = max(float(rec.get('max_event_loop_lag', 0.0)), lag)
+            if lag >= TG_DIAG_LOOP_LAG_WARN_SEC:
+                diag_log(
+                    'EVENT_LOOP_LAG lag=%.3fs active_tg=%s inflight=%s',
+                    lag,
+                    len(_TG_ACTIVE_REQUESTS),
+                    _tg_inflight_snapshot(),
+                )
+    except asyncio.CancelledError:
+        return
+
+
+def _start_tg_diagnostics() -> None:
+    global _TG_EVENT_LOOP_MONITOR_TASK
+    if not TG_DIAG_ENABLED:
+        return
+    if _TG_EVENT_LOOP_MONITOR_TASK is None or _TG_EVENT_LOOP_MONITOR_TASK.done():
+        _TG_EVENT_LOOP_MONITOR_TASK = asyncio.create_task(_tg_event_loop_monitor())
+        diag_log(
+            'TG_DIAG monitor_started aiogram=%s aiohttp=%s default_timeout=%s pool_limit=%s',
+            AIOGRAM_VERSION,
+            getattr(aiohttp, '__version__', ''),
+            getattr(telegram_session, 'timeout', None) if 'telegram_session' in globals() else None,
+            getattr(telegram_session, '_connector_init', {}).get('limit') if 'telegram_session' in globals() else None,
+        )
+
+
+class DiagnosticAiohttpSession(AiohttpSession):
+    """AiohttpSession with transport tracing. Request behavior and timeout stay unchanged."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._trace_config = self._build_trace_config()
+
+    def _build_trace_config(self) -> TraceConfig:
+        def ctx_factory(*, trace_request_ctx=None):
+            return SimpleNamespace(
+                request_id=_TG_REQUEST_ID.get(),
+                request_chunk_count=0,
+                request_bytes=0,
+                response_chunk_count=0,
+                response_bytes=0,
+            )
+
+        trace = TraceConfig(trace_config_ctx_factory=ctx_factory)
+
+        async def request_start(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'request_start', host=getattr(params.url, 'host', ''))
+
+        async def queued_start(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'connection_queued_start')
+
+        async def queued_end(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'connection_queued_end')
+
+        async def connection_create_start(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'connection_create_start')
+
+        async def connection_create_end(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'connection_create_end')
+
+        async def connection_reuse(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'connection_reused')
+
+        async def dns_start(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'dns_start', host=getattr(params, 'host', ''))
+
+        async def dns_end(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'dns_end', host=getattr(params, 'host', ''))
+
+        async def dns_hit(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'dns_cache_hit', host=getattr(params, 'host', ''))
+
+        async def dns_miss(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'dns_cache_miss', host=getattr(params, 'host', ''))
+
+        async def headers_sent(session, ctx, params):
+            self._trace_phase(ctx.request_id, 'request_headers_sent')
+
+        async def request_chunk_sent(session, ctx, params):
+            size = len(getattr(params, 'chunk', b'') or b'')
+            ctx.request_chunk_count += 1
+            ctx.request_bytes += size
+            if ctx.request_chunk_count == 1:
+                self._trace_phase(ctx.request_id, 'request_body_first_chunk', bytes=size)
+            rec = _TG_ACTIVE_REQUESTS.get(ctx.request_id)
+            if rec is not None:
+                rec['request_chunks'] = ctx.request_chunk_count
+                rec['request_bytes'] = ctx.request_bytes
+
+        async def response_chunk_received(session, ctx, params):
+            size = len(getattr(params, 'chunk', b'') or b'')
+            ctx.response_chunk_count += 1
+            ctx.response_bytes += size
+            if ctx.response_chunk_count == 1:
+                self._trace_phase(ctx.request_id, 'response_first_chunk', bytes=size)
+            rec = _TG_ACTIVE_REQUESTS.get(ctx.request_id)
+            if rec is not None:
+                rec['response_chunks'] = ctx.response_chunk_count
+                rec['response_bytes'] = ctx.response_bytes
+
+        async def request_end(session, ctx, params):
+            self._trace_phase(
+                ctx.request_id,
+                'request_end',
+                status=getattr(getattr(params, 'response', None), 'status', None),
+                request_chunks=ctx.request_chunk_count,
+                request_bytes=ctx.request_bytes,
+                response_chunks=ctx.response_chunk_count,
+                response_bytes=ctx.response_bytes,
+            )
+
+        async def request_exception(session, ctx, params):
+            exc = getattr(params, 'exception', None)
+            self._trace_phase(
+                ctx.request_id,
+                'request_exception',
+                exc=type(exc).__name__ if exc else '',
+                error=_tg_safe_error_text(exc),
+            )
+
+        trace.on_request_start.append(request_start)
+        trace.on_connection_queued_start.append(queued_start)
+        trace.on_connection_queued_end.append(queued_end)
+        trace.on_connection_create_start.append(connection_create_start)
+        trace.on_connection_create_end.append(connection_create_end)
+        trace.on_connection_reuseconn.append(connection_reuse)
+        trace.on_dns_resolvehost_start.append(dns_start)
+        trace.on_dns_resolvehost_end.append(dns_end)
+        trace.on_dns_cache_hit.append(dns_hit)
+        trace.on_dns_cache_miss.append(dns_miss)
+        if hasattr(trace, 'on_request_headers_sent'):
+            trace.on_request_headers_sent.append(headers_sent)
+        if hasattr(trace, 'on_request_chunk_sent'):
+            trace.on_request_chunk_sent.append(request_chunk_sent)
+        if hasattr(trace, 'on_response_chunk_received'):
+            trace.on_response_chunk_received.append(response_chunk_received)
+        trace.on_request_end.append(request_end)
+        trace.on_request_exception.append(request_exception)
+        return trace
+
+    async def create_session(self) -> ClientSession:
+        # This mirrors aiogram's own AiohttpSession.create_session(), adding only TraceConfig.
+        if self._should_reset_connector:
+            await self.close()
+        if self._session is None or self._session.closed:
+            self._session = ClientSession(
+                connector=self._connector_type(**self._connector_init),
+                headers={USER_AGENT: f'{SERVER_SOFTWARE} aiogram/{AIOGRAM_VERSION}'},
+                trace_configs=[self._trace_config],
+            )
+        self._should_reset_connector = False
+        return self._session
+
+    def _pool_snapshot(self) -> dict:
+        try:
+            session = self._session
+            connector = getattr(session, 'connector', None) if session is not None else None
+            if connector is None:
+                return {'session': 'none'}
+            acquired = len(getattr(connector, '_acquired', ()) or ())
+            conns = getattr(connector, '_conns', {}) or {}
+            pooled = sum(len(items) for items in conns.values())
+            waiters_map = getattr(connector, '_waiters', {}) or {}
+            waiters = sum(len(items) for items in waiters_map.values())
+            return {
+                'closed': bool(getattr(session, 'closed', False)),
+                'limit': getattr(connector, 'limit', None),
+                'limit_per_host': getattr(connector, 'limit_per_host', None),
+                'acquired': acquired,
+                'pooled': pooled,
+                'waiters': waiters,
+            }
+        except Exception as exc:
+            return {'snapshot_error': type(exc).__name__}
+
+    def _trace_phase(self, request_id: str, phase: str, **extra) -> None:
+        if not request_id:
+            return
+        rec = _TG_ACTIVE_REQUESTS.get(request_id)
+        if rec is None:
+            return
+        now = time.monotonic()
+        previous_phase_at = float(rec.get('last_phase_at', rec.get('started', now)))
+        rec['last_phase'] = phase
+        rec['last_phase_at'] = now
+        rec.setdefault('phases', []).append((phase, now))
+        if rec.get('verbose', True) or phase in ('request_exception',):
+            diag_log(
+                'TG_TRACE id=%s method=%s phase=%s since_prev=%.3fs age=%.3fs extra=%s pool=%s',
+                request_id,
+                rec.get('method'),
+                phase,
+                now - previous_phase_at,
+                now - float(rec.get('started', now)),
+                extra,
+                self._pool_snapshot(),
+            )
+
+    async def _watch_request(self, request_id: str) -> None:
+        previous = 0.0
+        try:
+            for threshold in TG_DIAG_WATCH_THRESHOLDS:
+                await asyncio.sleep(max(0.0, threshold - previous))
+                previous = threshold
+                rec = _TG_ACTIVE_REQUESTS.get(request_id)
+                if rec is None:
+                    return
+                now = time.monotonic()
+                inflight = _tg_inflight_snapshot()
+                pool = self._pool_snapshot()
+                phase_age = now - float(rec.get('last_phase_at', rec.get('started', now)))
+                diag_log(
+                    'TG_REQUEST STILL_WAITING id=%s method=%s chat=%s order=%s step=%s age=%.3fs '
+                    'last_phase=%s phase_age=%.3fs max_loop_lag=%.3fs inflight=%s pool=%s '
+                    'request_chunks=%s request_bytes=%s response_chunks=%s response_bytes=%s',
+                    request_id,
+                    rec.get('method'),
+                    rec.get('chat_id'),
+                    rec.get('order_id'),
+                    rec.get('step'),
+                    now - float(rec.get('started', now)),
+                    rec.get('last_phase'),
+                    phase_age,
+                    float(rec.get('max_event_loop_lag', 0.0)),
+                    inflight,
+                    pool,
+                    rec.get('request_chunks', 0),
+                    rec.get('request_bytes', 0),
+                    rec.get('response_chunks', 0),
+                    rec.get('response_bytes', 0),
+                )
+                if threshold in (10.0, 30.0):
+                    diag_log(
+                        'TG_REQUEST SNAPSHOT id=%s age=%.1fs process=%s task_stack=%s',
+                        request_id,
+                        threshold,
+                        _tg_process_snapshot(),
+                        _tg_task_stack(rec.get('task')),
+                    )
+                    asyncio.create_task(_tg_network_probe(request_id, threshold))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception('TG diagnostic watchdog failed id=%s', request_id)
+
+    async def make_request(self, bot, method, timeout=None):
+        if not TG_DIAG_ENABLED:
+            return await super().make_request(bot, method, timeout=timeout)
+        request_id = _tg_new_request_id()
+        method_name = _tg_method_name(method)
+        chat_id = _tg_extract_chat_id(method)
+        order_id, step = _tg_order_context(chat_id)
+        started = time.monotonic()
+        verbose = method_name != 'getUpdates'
+        effective_timeout = self.timeout if timeout is None else timeout
+        rec = {
+            'id': request_id,
+            'method': method_name,
+            'chat_id': chat_id,
+            'order_id': order_id,
+            'step': step,
+            'started': started,
+            'last_phase': 'aiogram_call_start',
+            'last_phase_at': started,
+            'max_event_loop_lag': 0.0,
+            'task': asyncio.current_task(),
+            'verbose': verbose,
+            'timeout': effective_timeout,
+            'request_chunks': 0,
+            'request_bytes': 0,
+            'response_chunks': 0,
+            'response_bytes': 0,
+        }
+        _TG_ACTIVE_REQUESTS[request_id] = rec
+        inflight = _tg_inflight_snapshot()
+        if verbose:
+            diag_log(
+                'TG_REQUEST START id=%s method=%s chat=%s order=%s step=%s timeout=%s inflight=%s pool=%s',
+                request_id,
+                method_name,
+                chat_id,
+                order_id,
+                step,
+                effective_timeout,
+                inflight,
+                self._pool_snapshot(),
+            )
+        token = _TG_REQUEST_ID.set(request_id)
+        watchdog = asyncio.create_task(self._watch_request(request_id)) if verbose else None
+        try:
+            result = await super().make_request(bot, method, timeout=timeout)
+            duration = time.monotonic() - started
+            if verbose:
+                diag_log(
+                    'TG_REQUEST OK id=%s method=%s chat=%s duration=%.3fs result_type=%s message_id=%s '
+                    'last_phase=%s max_loop_lag=%.3fs pool=%s',
+                    request_id,
+                    method_name,
+                    chat_id,
+                    duration,
+                    type(result).__name__,
+                    getattr(result, 'message_id', None),
+                    rec.get('last_phase'),
+                    float(rec.get('max_event_loop_lag', 0.0)),
+                    self._pool_snapshot(),
+                )
+            return result
+        except Exception as exc:
+            duration = time.monotonic() - started
+            root = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+            retry_after = getattr(exc, 'retry_after', None)
+            if retry_after is not None:
+                diag_log(
+                    'TG_RATE_LIMIT id=%s method=%s chat=%s duration=%.3fs retry_after=%s',
+                    request_id,
+                    method_name,
+                    chat_id,
+                    duration,
+                    retry_after,
+                )
+            logger.error(
+                '[DIAG] TG_REQUEST ERROR id=%s method=%s chat=%s order=%s step=%s duration=%.3fs '
+                'timeout=%s exc=%s root_exc=%s error=%s root_error=%s last_phase=%s phase_age=%.3fs '
+                'max_loop_lag=%.3fs inflight=%s pool=%s task_stack=%s',
+                request_id,
+                method_name,
+                chat_id,
+                order_id,
+                step,
+                duration,
+                effective_timeout,
+                type(exc).__name__,
+                type(root).__name__ if root else '',
+                _tg_safe_error_text(exc),
+                _tg_safe_error_text(root),
+                rec.get('last_phase'),
+                time.monotonic() - float(rec.get('last_phase_at', started)),
+                float(rec.get('max_event_loop_lag', 0.0)),
+                _tg_inflight_snapshot(),
+                self._pool_snapshot(),
+                _tg_task_stack(rec.get('task')),
+            )
+            raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            _TG_REQUEST_ID.reset(token)
+            _TG_ACTIVE_REQUESTS.pop(request_id, None)
+
+
+telegram_session = DiagnosticAiohttpSession()
+bot = Bot(BOT_TOKEN, session=telegram_session)
 dp = Dispatcher()
 
 async def notify_admin_new_order(msg: Message, st: OrderState):
@@ -3352,6 +3939,7 @@ async def handle_poll_answer(poll_answer: PollAnswer):
 
 async def main():
     logger.info('Starting AmbaLab Bot...')
+    _start_tg_diagnostics()
     # asyncio.create_task(_midnight_scheduler())   # тимчасово вимкнули
     # Before starting polling, warm up the doctor phone cache.  This loads
     # existing chat_id → phone mappings from Лист2 so the bot does not have
@@ -3370,6 +3958,7 @@ async def _health(request):
     return web.Response(text="ok")
 
 async def _main():
+    _start_tg_diagnostics()
     # 1) HTTP-сервер для healthcheck-ів Cloud Run
     app = web.Application()
     app.add_routes([web.get("/", _health), web.get("/healthz", _health)])
