@@ -2009,7 +2009,7 @@ def _start_tg_diagnostics() -> None:
 
 
 class DiagnosticAiohttpSession(AiohttpSession):
-    """AiohttpSession with transport tracing. Request behavior and timeout stay unchanged."""
+    """Telegram session with transport tracing, short connect timeout and one safe retry."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2095,6 +2095,9 @@ class DiagnosticAiohttpSession(AiohttpSession):
 
         async def request_exception(session, ctx, params):
             exc = getattr(params, 'exception', None)
+            rec = _TG_ACTIVE_REQUESTS.get(ctx.request_id)
+            if rec is not None:
+                rec['failure_phase'] = rec.get('last_phase')
             self._trace_phase(
                 ctx.request_id,
                 'request_exception',
@@ -2228,8 +2231,7 @@ class DiagnosticAiohttpSession(AiohttpSession):
             logger.exception('TG diagnostic watchdog failed id=%s', request_id)
 
     async def make_request(self, bot, method, timeout=None):
-        if not TG_DIAG_ENABLED:
-            return await super().make_request(bot, method, timeout=timeout)
+        # Network protection must work even if verbose diagnostics are disabled.
         request_id = _tg_new_request_id()
         method_name = _tg_method_name(method)
         chat_id = _tg_extract_chat_id(method)
@@ -2272,7 +2274,47 @@ class DiagnosticAiohttpSession(AiohttpSession):
         token = _TG_REQUEST_ID.set(request_id)
         watchdog = asyncio.create_task(self._watch_request(request_id)) if verbose else None
         try:
-            result = await super().make_request(bot, method, timeout=timeout)
+            if isinstance(effective_timeout, aiohttp.ClientTimeout):
+                total_timeout = float(effective_timeout.total or 60.0)
+            else:
+                total_timeout = float(effective_timeout or 60.0)
+            request_timeout = aiohttp.ClientTimeout(
+                total=total_timeout,
+                connect=5.0,
+                sock_connect=5.0,
+                sock_read=total_timeout,
+            )
+            try:
+                result = await super().make_request(bot, method, timeout=request_timeout)
+            except Exception as first_exc:
+                phases = [name for name, _ in rec.get('phases', [])]
+                failure_phase = rec.get('failure_phase') or rec.get('last_phase')
+                root = getattr(first_exc, '__cause__', None) or getattr(first_exc, '__context__', None)
+                safe_retry = (
+                    method_name != 'getUpdates'
+                    and (isinstance(root, (asyncio.TimeoutError, TimeoutError)) or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError)))
+                    and failure_phase in {'connection_create_start', 'dns_start', 'dns_end', 'dns_cache_hit', 'dns_cache_miss'}
+                    and int(rec.get('request_bytes', 0) or 0) == 0
+                    and 'request_headers_sent' not in phases
+                    and 'request_body_first_chunk' not in phases
+                )
+                if not safe_retry:
+                    diag_log('TG_SAFE_RETRY DENIED id=%s method=%s failure_phase=%s request_bytes=%s', request_id, method_name, failure_phase, rec.get('request_bytes', 0))
+                    raise
+                diag_log('TG_SAFE_RETRY ALLOWED id=%s method=%s failure_phase=%s request_bytes=0', request_id, method_name, failure_phase)
+                fresh_session = AiohttpSession()
+                fresh_session._connector_init = dict(getattr(fresh_session, '_connector_init', {}) or {})
+                fresh_session._connector_init['force_close'] = True
+                retry_started = time.monotonic()
+                try:
+                    diag_log('TG_SAFE_RETRY START id=%s method=%s fresh_connection=True', request_id, method_name)
+                    result = await fresh_session.make_request(bot, method, timeout=request_timeout)
+                    diag_log('TG_SAFE_RETRY OK id=%s method=%s duration=%.3fs', request_id, method_name, time.monotonic() - retry_started)
+                except Exception as retry_exc:
+                    diag_log('TG_SAFE_RETRY FAILED id=%s method=%s duration=%.3fs exc=%s', request_id, method_name, time.monotonic() - retry_started, type(retry_exc).__name__)
+                    raise retry_exc from first_exc
+                finally:
+                    await fresh_session.close()
             duration = time.monotonic() - started
             if verbose:
                 diag_log(
@@ -2459,15 +2501,15 @@ async def new_order(msg: Message):
             asyncio.create_task(_append_row_bg(msg, st, base_values))
 
             if not phone:
+                st.step = 'doctor_phone'
+                await save_bot_state_async(msg.chat.id, st)
                 with diag_timer('new_order.answer_phone', chat_id=msg.chat.id, order_id=st.order_id):
                     await msg.answer('Вкажіть, будь ласка, Ваш номер телефону у міжнародному форматі:', reply_markup=bottom_nav_kb())
-                st.step = 'doctor_phone'
             else:
+                st.step = 'patient_lastname'
+                await save_bot_state_async(msg.chat.id, st)
                 with diag_timer('new_order.answer_lastname', chat_id=msg.chat.id, order_id=st.order_id):
                     await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
-                st.step = 'patient_lastname'
-
-            await save_bot_state_async(msg.chat.id, st)
             diag_log('new_order.end chat=%s order=%s step=%s', msg.chat.id, st.order_id, st.step)
 
         except Exception:
@@ -2504,9 +2546,9 @@ async def ask_notes(msg: Message, st: OrderState):
     # Reset the Done lock when entering the notes step so that the Done button
     # can be used again in this new context.
     st.done_lock = False
-    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', reply_markup=notes_yesno_kb())
     st.step = 'await_notes_choice'
     await save_bot_state_async(msg.chat.id, st)
+    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', reply_markup=notes_yesno_kb())
 
 async def finalize_order(msg: Message, st: OrderState):
     diag_log('finalize.start chat=%s order=%s row=%s step=%s', msg.chat.id, getattr(st, 'order_id', None), getattr(st, 'sheet_row', None), getattr(st, 'step', None))
@@ -2873,13 +2915,13 @@ async def flow(msg: Message):
         if is_done_text(choice):
             return
         if choice == 'Так':
+            st.step = 'await_notes'
+            await save_bot_state_async(msg.chat.id, st)
             await msg.answer(
                 '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля першого збереженого повідомлення зʼявиться кнопка «✅ Готово».',
                 reply_markup=bottom_nav_kb(),
                 parse_mode='HTML'
             )
-            st.step = 'await_notes'
-            await save_bot_state_async(msg.chat.id, st)
             return
         if choice == 'Ні':
             await finalize_order(msg, st)
@@ -2923,22 +2965,23 @@ async def flow(msg: Message):
                 label = f"{kind} №{w.get('Number')}: {(w.get('ShortAddress') or w.get('Description'))[:64]}"
                 rows.append([InlineKeyboardButton(text=label, callback_data=f"np_wh_pick:{w.get('Ref', '')}")])
             rows.append([InlineKeyboardButton(text='↩️ Ввести інший номер', callback_data='np_wh_back')])
+            st.step = 'await_np_pick'
+            await save_bot_state_async(msg.chat.id, st)
             resp = await msg.answer('Знайшлось кілька варіантів. Оберіть потрібний:', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
             st = state_by_chat.get(msg.chat.id)
             if st:
                 st.last_inline_msg_id = resp.message_id
-            st.step = 'await_np_pick'
             return
         w = whs[0]
         desc = w.get('Description', f'№{num}')
         if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', desc, msg): return
         if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', w.get('Ref', ''), msg): return
         np_save_current_delivery(msg.chat.id, st)
+        st.step = 'choose_files_method'
+        await save_bot_state_async(msg.chat.id, st)
         await msg.answer(f'✅ Адресу доставки збережено: <b>{desc}</b>', parse_mode='HTML')
         await _clear_inline_markup(msg)
         await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
-        st.step = 'choose_files_method'
-        await save_bot_state_async(msg.chat.id, st)
         return
     if st.delivery_step:
         txt = (msg.text or '').strip()
@@ -3016,9 +3059,9 @@ async def flow(msg: Message):
         # coroutine is detached via create_task to avoid blocking the flow.
         asyncio.create_task(doctor_phone_save_bg(msg.chat.id, txt_norm))
         # Prompt for the next step without waiting for the background task
-        await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
         st.step = 'patient_lastname'
         await save_bot_state_async(msg.chat.id, st)
+        await msg.answer('Вкажіть, будь ласка, прізвище пацієнта:', reply_markup=bottom_nav_kb())
         return
     if st.step == 'patient_lastname':
         val = (msg.text or '').strip()
@@ -3030,10 +3073,10 @@ async def flow(msg: Message):
         diag_log('lastname.state_saved chat=%s order=%s row=%s', msg.chat.id, st.order_id, st.sheet_row)
         with diag_timer('lastname.safe_set_cell', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
             if not await _safe_set_cell(st.sheet_row, 'patient_lastname', st.patient_lastname, msg): return
-        with diag_timer('lastname.answer_work_type', chat_id=msg.chat.id, order_id=st.order_id):
-            await msg.answer('Який апарат замовляєте (сплінт, елайнери тощо):', reply_markup=bottom_nav_kb())
         st.step = 'work_type'
         await save_bot_state_async(msg.chat.id, st)
+        with diag_timer('lastname.answer_work_type', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer('Який апарат замовляєте (сплінт, елайнери тощо):', reply_markup=bottom_nav_kb())
         diag_log('lastname.end chat=%s order=%s row=%s next_step=%s', msg.chat.id, st.order_id, st.sheet_row, st.step)
         return
     if st.step == 'work_type':
@@ -3045,10 +3088,10 @@ async def flow(msg: Message):
         st.work_type = val
         with diag_timer('work_type.safe_set_cell', chat_id=msg.chat.id, order_id=st.order_id, row=st.sheet_row):
             if not await _safe_set_cell(st.sheet_row, 'work_type', st.work_type, msg): return
-        with diag_timer('work_type.answer_due_date', chat_id=msg.chat.id, order_id=st.order_id):
-            await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         st.step = 'due_date'
         await save_bot_state_async(msg.chat.id, st)
+        with diag_timer('work_type.answer_due_date', chat_id=msg.chat.id, order_id=st.order_id):
+            await msg.answer('Вкажіть дату здачі у форматі ДД.ММ або ДД.ММ.РРРР (наприклад 05.10):', reply_markup=bottom_nav_kb())
         diag_log('work_type.end chat=%s order=%s row=%s next_step=%s', msg.chat.id, st.order_id, st.sheet_row, st.step)
         return
     if st and st.step == 'due_date':
@@ -3071,24 +3114,26 @@ async def flow(msg: Message):
             return
 
         profiles = np_profiles_list(msg.chat.id)
+        st.step = 'np_menu'
+        await save_bot_state_async(msg.chat.id, st)
         await msg.answer(
             'Доставити замовлення Новою Поштою. Оберіть пункт меню:',
             reply_markup=np_menu_kb(has_saved=bool(profiles))
         )
-        st.step = 'np_menu'
-        await save_bot_state_async(msg.chat.id, st)
         return
     if st and st.step == 'np_menu':
         t = (msg.text or '').strip()
         if t == NP_MENU_ADD:
             st.delivery_step = 'recv_name'
+            await save_bot_state_async(msg.chat.id, st)
             await msg.answer('Вкажіть ПІБ отримувача:', reply_markup=bottom_nav_kb())
             return
         if t == NP_MENU_USE_SAVED:
             profiles = np_profiles_list(msg.chat.id)
             if not profiles:
-                await msg.answer('Збережені адреси відсутні. Заповніть доставку.', reply_markup=bottom_nav_kb())
                 st.delivery_step = 'recv_name'
+                await save_bot_state_async(msg.chat.id, st)
+                await msg.answer('Збережені адреси відсутні. Заповніть доставку.', reply_markup=bottom_nav_kb())
                 await msg.answer('Вкажіть ПІБ отримувача:', reply_markup=bottom_nav_kb())
                 return
             if len(profiles) == 1:
@@ -3110,9 +3155,10 @@ async def flow(msg: Message):
                 await msg.answer('Дані доставки підставлено.')
                 await _clear_inline_markup(msg)
                 await _clear_inline_markup(msg)
-                await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
                 st.delivery_step = ''
                 st.step = 'choose_files_method'
+                await save_bot_state_async(msg.chat.id, st)
+                await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
                 return
             rows = []
             for pr in profiles[:20]:
@@ -3150,32 +3196,32 @@ async def flow(msg: Message):
             st.delivery_step = ''
             await _clear_inline_markup(msg)
             await _clear_inline_markup(msg)
-            await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             st.step = 'choose_files_method'
             await save_bot_state_async(msg.chat.id, st)
+            await msg.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
             return
     if st.step == 'choose_files_method':
         t = msg.text or ''
         if 'Завантажити у бот' in t:
             append_files_method(st.sheet_row, 'telegram_upload')
             st.accepted_files_count = 0
+            st.step = 'await_tele_files'
+            await save_bot_state_async(msg.chat.id, st)
             await msg.answer("""📎 <b>Надішліть файли</b> (можна кілька)
 
 Коли надішлете <b>ВСІ</b> файли, дочекайтеся <b>ПОВНОГО</b> завантаження
 і натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
-            st.step = 'await_tele_files'
-            await save_bot_state_async(msg.chat.id, st)
             return
         if 'Надати посилання' in t:
             append_files_method(st.sheet_row, 'link')
             st.accepted_links_count = 0
             st.pending_links = []
+            st.step = 'await_links'
+            await save_bot_state_async(msg.chat.id, st)
             await msg.answer("""🔗 <b>Надішліть посилання</b> (можна кілька)
 
 Коли відправите <b>ВСІ</b> посилання -
 натисніть «✅ Готово».""", reply_markup=files_aux_kb(), parse_mode='HTML')
-            st.step = 'await_links'
-            await save_bot_state_async(msg.chat.id, st)
             return
         if 'e-mail' in t.lower() or 'email' in t.lower():
             append_files_method(st.sheet_row, 'email')
@@ -3190,9 +3236,9 @@ async def flow(msg: Message):
 🧾 <code>{subject}</code>
 
 Після відправлення листа натисніть «✅ Готово»."""
-            await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             st.step = 'email_wait_done'
             await save_bot_state_async(msg.chat.id, st)
+            await msg.answer(text, parse_mode='HTML', reply_markup=files_aux_kb())
             return
         if 'Відбитки' in t:
             append_files_method(st.sheet_row, 'Imprint')
