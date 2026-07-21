@@ -1,7 +1,7 @@
 import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
-import os, io, asyncio, logging, re, threading
+import os, io, asyncio, logging, re, threading, sys
 URL_RE = re.compile('(?i)\\b((?:https?|ftp)://[^\\s<>]+|www\\.[^\\s<>]+|[a-z0-9.-]+\\.[a-z]{2,}[^\\s<>]*)')
 
 def extract_urls(text: str):
@@ -1772,10 +1772,52 @@ TG_DIAG_ENABLED = os.getenv('TG_DIAG_ENABLED', '1') == '1'
 TG_DIAG_LOOP_LAG_WARN_SEC = float(os.getenv('TG_DIAG_LOOP_LAG_WARN_SEC', '0.50'))
 TG_DIAG_PROBE_TIMEOUT_SEC = float(os.getenv('TG_DIAG_PROBE_TIMEOUT_SEC', '5.0'))
 TG_DIAG_WATCH_THRESHOLDS = (3.0, 10.0, 30.0, 55.0)
+TG_SAFE_THIRD_RETRY_DELAY_SEC = float(os.getenv('TG_SAFE_THIRD_RETRY_DELAY_SEC', '10.0'))
+TG_SAFE_RESCUE_RETRY_DELAY_SEC = float(os.getenv('TG_SAFE_RESCUE_RETRY_DELAY_SEC', '40.0'))
+
+# Modern aiohttp transport settings. aiohttp >= 3.10 is required because
+# happy_eyeballs_delay/interleave were added to TCPConnector in that branch.
+TG_DNS_CACHE_TTL_SEC = int(os.getenv('TG_DNS_CACHE_TTL_SEC', '60'))
+TG_HAPPY_EYEBALLS_DELAY_SEC = float(os.getenv('TG_HAPPY_EYEBALLS_DELAY_SEC', '0.25'))
+TG_HAPPY_EYEBALLS_INTERLEAVE = int(os.getenv('TG_HAPPY_EYEBALLS_INTERLEAVE', '1'))
+TG_CONNECT_TIMEOUT_SEC = float(os.getenv('TG_CONNECT_TIMEOUT_SEC', '5.0'))
+TG_MIN_AIOHTTP_VERSION = (3, 10, 0)
+TG_MIN_AIOGRAM_VERSION = (3, 30, 0)
+TG_RECOMMENDED_AIOGRAM_VERSION = '3.30.0'
+TG_RECOMMENDED_AIOHTTP_VERSION = '3.14.2'
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    parts = []
+    for token in re.findall(r'\d+', str(value or ''))[:3]:
+        parts.append(int(token))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _assert_modern_telegram_transport() -> None:
+    aiohttp_version = str(getattr(aiohttp, '__version__', '') or '')
+    aiogram_version = str(AIOGRAM_VERSION or '')
+    if _version_tuple(aiogram_version) < TG_MIN_AIOGRAM_VERSION:
+        raise RuntimeError(
+            f'This test build requires aiogram>={TG_RECOMMENDED_AIOGRAM_VERSION}. '
+            f'Installed aiogram={aiogram_version or "unknown"}.'
+        )
+    if _version_tuple(aiohttp_version) < TG_MIN_AIOHTTP_VERSION:
+        raise RuntimeError(
+            'This bot build requires aiohttp>=3.10 for Happy Eyeballs. '
+            f'Installed aiohttp={aiohttp_version or "unknown"}. '
+            f'Use aiogram=={TG_RECOMMENDED_AIOGRAM_VERSION} and '
+            f'aiohttp=={TG_RECOMMENDED_AIOHTTP_VERSION}.'
+        )
+    if sys.version_info < (3, 10):
+        raise RuntimeError('aiogram 3.30 requires Python 3.10 or newer')
 
 _TG_REQUEST_ID = contextvars.ContextVar('tg_request_id', default='')
 _TG_ACTIVE_REQUESTS: Dict[str, dict] = {}
 _TG_EVENT_LOOP_MONITOR_TASK: Optional[asyncio.Task] = None
+_TG_RESCUE_TASKS: Set[asyncio.Task] = set()
 _TG_LAST_EVENT_LOOP_LAG = 0.0
 _TG_LAST_EVENT_LOOP_LAG_TS = 0.0
 
@@ -1875,27 +1917,34 @@ def _tg_process_snapshot() -> dict:
 
 
 async def _tg_network_probe(request_id: str, reason_age: float) -> None:
-    """Independent DNS + TCP/TLS + HTTPS probe without bot token or Bot API method."""
+    """Independent DNS and per-family TCP/TLS/HTTPS probes without bot credentials."""
     if not TG_DIAG_ENABLED:
         return
+
     host = 'api.telegram.org'
     loop = asyncio.get_running_loop()
     started = time.monotonic()
-    addresses = []
+    resolved: dict[int, list[str]] = {socket.AF_INET: [], socket.AF_INET6: []}
+
     try:
         dns_started = time.monotonic()
         result = await asyncio.wait_for(
             loop.getaddrinfo(host, 443, type=socket.SOCK_STREAM),
             timeout=TG_DIAG_PROBE_TIMEOUT_SEC,
         )
-        dns_duration = time.monotonic() - dns_started
-        addresses = sorted({str(item[4][0]) for item in result if item and len(item) >= 5})[:8]
+        for family, _socktype, _proto, _canonname, sockaddr in result:
+            if family not in resolved or not sockaddr:
+                continue
+            ip = str(sockaddr[0])
+            if ip not in resolved[family]:
+                resolved[family].append(ip)
         diag_log(
-            'TG_PROBE DNS_OK id=%s trigger_age=%.1fs duration=%.3fs addresses=%s',
+            'TG_PROBE DNS_OK id=%s trigger_age=%.1fs duration=%.3fs ipv4=%s ipv6=%s',
             request_id,
             reason_age,
-            dns_duration,
-            addresses,
+            time.monotonic() - dns_started,
+            resolved[socket.AF_INET][:8],
+            resolved[socket.AF_INET6][:8],
         )
     except Exception as exc:
         diag_log(
@@ -1908,61 +1957,96 @@ async def _tg_network_probe(request_id: str, reason_age: float) -> None:
         )
         return
 
-    writer = None
-    try:
-        connect_started = time.monotonic()
-        ssl_ctx = ssl.create_default_context()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, 443, ssl=ssl_ctx, server_hostname=host),
-            timeout=TG_DIAG_PROBE_TIMEOUT_SEC,
-        )
-        connect_duration = time.monotonic() - connect_started
-        peer = writer.get_extra_info('peername')
-        ssl_obj = writer.get_extra_info('ssl_object')
-        tls_version = ssl_obj.version() if ssl_obj else ''
+    async def probe_family(family: int, label: str) -> None:
+        addresses = resolved.get(family) or []
+        if not addresses:
+            diag_log(
+                'TG_PROBE FAMILY_SKIPPED id=%s family=%s reason=no_address',
+                request_id,
+                label,
+            )
+            return
+
+        last_exc = None
+        family_started = time.monotonic()
+        for ip in addresses[:3]:
+            writer = None
+            attempt_started = time.monotonic()
+            try:
+                ssl_ctx = ssl.create_default_context()
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        host=ip,
+                        port=443,
+                        family=family,
+                        ssl=ssl_ctx,
+                        server_hostname=host,
+                    ),
+                    timeout=TG_DIAG_PROBE_TIMEOUT_SEC,
+                )
+                peer = writer.get_extra_info('peername')
+                ssl_obj = writer.get_extra_info('ssl_object')
+                tls_version = ssl_obj.version() if ssl_obj else ''
+                connect_duration = time.monotonic() - attempt_started
+
+                writer.write(
+                    b'GET / HTTP/1.1\r\n'
+                    b'Host: api.telegram.org\r\n'
+                    b'User-Agent: AmbaLab-TG-Diagnostics/2\r\n'
+                    b'Connection: close\r\n\r\n'
+                )
+                await asyncio.wait_for(writer.drain(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC)
+                status_line = await asyncio.wait_for(
+                    reader.readline(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC
+                )
+                diag_log(
+                    'TG_PROBE FAMILY_OK id=%s family=%s ip=%s connect=%.3fs total=%.3fs '
+                    'peer=%s tls=%s status_line=%s',
+                    request_id,
+                    label,
+                    ip,
+                    connect_duration,
+                    time.monotonic() - family_started,
+                    peer,
+                    tls_version,
+                    status_line.decode('ascii', errors='replace').strip()[:120],
+                )
+                return
+            except Exception as exc:
+                last_exc = exc
+                diag_log(
+                    'TG_PROBE FAMILY_ATTEMPT_ERROR id=%s family=%s ip=%s duration=%.3fs '
+                    'exc=%s error=%s',
+                    request_id,
+                    label,
+                    ip,
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                    _tg_safe_error_text(exc),
+                )
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
         diag_log(
-            'TG_PROBE TCP_TLS_OK id=%s trigger_age=%.1fs duration=%.3fs peer=%s tls=%s',
+            'TG_PROBE FAMILY_FAILED id=%s family=%s total=%.3fs addresses=%s exc=%s error=%s',
             request_id,
-            reason_age,
-            connect_duration,
-            peer,
-            tls_version,
+            label,
+            time.monotonic() - family_started,
+            addresses[:3],
+            type(last_exc).__name__ if last_exc else '',
+            _tg_safe_error_text(last_exc),
         )
 
-        https_started = time.monotonic()
-        writer.write(
-            b'GET / HTTP/1.1\r\n'
-            b'Host: api.telegram.org\r\n'
-            b'User-Agent: AmbaLab-TG-Diagnostics/1\r\n'
-            b'Connection: close\r\n\r\n'
-        )
-        await asyncio.wait_for(writer.drain(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC)
-        status_line = await asyncio.wait_for(reader.readline(), timeout=TG_DIAG_PROBE_TIMEOUT_SEC)
-        diag_log(
-            'TG_PROBE HTTPS_OK id=%s trigger_age=%.1fs duration=%.3fs status_line=%s total=%.3fs',
-            request_id,
-            reason_age,
-            time.monotonic() - https_started,
-            status_line.decode('ascii', errors='replace').strip()[:120],
-            time.monotonic() - started,
-        )
-    except Exception as exc:
-        diag_log(
-            'TG_PROBE CONNECT_OR_HTTPS_ERROR id=%s trigger_age=%.1fs total=%.3fs exc=%s error=%s addresses=%s',
-            request_id,
-            reason_age,
-            time.monotonic() - started,
-            type(exc).__name__,
-            _tg_safe_error_text(exc),
-            addresses,
-        )
-    finally:
-        if writer is not None:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+    await asyncio.gather(
+        probe_family(socket.AF_INET, 'ipv4'),
+        probe_family(socket.AF_INET6, 'ipv6'),
+        return_exceptions=True,
+    )
 
 
 async def _tg_event_loop_monitor() -> None:
@@ -2000,19 +2084,37 @@ def _start_tg_diagnostics() -> None:
     if _TG_EVENT_LOOP_MONITOR_TASK is None or _TG_EVENT_LOOP_MONITOR_TASK.done():
         _TG_EVENT_LOOP_MONITOR_TASK = asyncio.create_task(_tg_event_loop_monitor())
         diag_log(
-            'TG_DIAG monitor_started aiogram=%s aiohttp=%s default_timeout=%s pool_limit=%s',
+            'TG_DIAG monitor_started aiogram=%s aiohttp=%s python=%s default_timeout=%s '
+            'pool_limit=%s dns_ttl=%s happy_eyeballs_delay=%s interleave=%s family=%s',
             AIOGRAM_VERSION,
             getattr(aiohttp, '__version__', ''),
+            '.'.join(map(str, sys.version_info[:3])),
             getattr(telegram_session, 'timeout', None) if 'telegram_session' in globals() else None,
             getattr(telegram_session, '_connector_init', {}).get('limit') if 'telegram_session' in globals() else None,
+            getattr(telegram_session, '_connector_init', {}).get('ttl_dns_cache') if 'telegram_session' in globals() else None,
+            getattr(telegram_session, '_connector_init', {}).get('happy_eyeballs_delay') if 'telegram_session' in globals() else None,
+            getattr(telegram_session, '_connector_init', {}).get('interleave') if 'telegram_session' in globals() else None,
+            getattr(telegram_session, '_connector_init', {}).get('family') if 'telegram_session' in globals() else None,
         )
 
 
 class DiagnosticAiohttpSession(AiohttpSession):
-    """Telegram session with transport tracing, short connect timeout and one safe retry."""
+    """Telegram session with transport tracing, short connect timeout, safe retries and delayed rescue delivery."""
 
     def __init__(self, *args, **kwargs):
+        _assert_modern_telegram_transport()
         super().__init__(*args, **kwargs)
+
+        # Preserve aiogram's SSL context and pool limit, but replace the old
+        # one-address-at-a-time connection behaviour with aiohttp's modern
+        # Happy Eyeballs strategy. AF_UNSPEC allows IPv4 and IPv6 candidates.
+        self._connector_init = dict(getattr(self, '_connector_init', {}) or {})
+        self._connector_init.update({
+            'family': socket.AF_UNSPEC,
+            'ttl_dns_cache': TG_DNS_CACHE_TTL_SEC,
+            'happy_eyeballs_delay': TG_HAPPY_EYEBALLS_DELAY_SEC,
+            'interleave': TG_HAPPY_EYEBALLS_INTERLEAVE,
+        })
         self._trace_config = self._build_trace_config()
 
     def _build_trace_config(self) -> TraceConfig:
@@ -2280,41 +2382,270 @@ class DiagnosticAiohttpSession(AiohttpSession):
                 total_timeout = float(effective_timeout or 60.0)
             request_timeout = aiohttp.ClientTimeout(
                 total=total_timeout,
-                connect=5.0,
-                sock_connect=5.0,
+                connect=min(TG_CONNECT_TIMEOUT_SEC, total_timeout),
+                sock_connect=min(TG_CONNECT_TIMEOUT_SEC, total_timeout),
                 sock_read=total_timeout,
             )
+            def _is_safe_connection_failure(exc, attempt_phases, failure_phase, request_bytes):
+                root = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+                network_types = (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    aiohttp.ClientConnectionError,
+                    OSError,
+                )
+                return (
+                    method_name != 'getUpdates'
+                    and (isinstance(root, network_types) or isinstance(exc, network_types))
+                    and failure_phase in {'connection_create_start', 'dns_start', 'dns_end', 'dns_cache_hit', 'dns_cache_miss'}
+                    and int(request_bytes or 0) == 0
+                    and 'request_headers_sent' not in attempt_phases
+                    and 'request_body_first_chunk' not in attempt_phases
+                )
+
+            async def _fresh_connection_attempt(attempt_no: int):
+                # Use the diagnostic subclass for tracing, but call the base implementation
+                # directly so this helper does not start its own nested retry chain.
+                fresh_session = DiagnosticAiohttpSession()
+                fresh_session._connector_init = dict(getattr(fresh_session, '_connector_init', {}) or {})
+                fresh_session._connector_init['force_close'] = True
+                attempt_started = time.monotonic()
+                phase_offset = len(rec.get('phases', []))
+                rec['failure_phase'] = None
+                rec['request_chunks'] = 0
+                rec['request_bytes'] = 0
+                rec['response_chunks'] = 0
+                rec['response_bytes'] = 0
+                try:
+                    diag_log(
+                        'TG_SAFE_RETRY ATTEMPT_START id=%s method=%s attempt=%s fresh_connection=True',
+                        request_id,
+                        method_name,
+                        attempt_no,
+                    )
+                    attempt_result = await super(DiagnosticAiohttpSession, fresh_session).make_request(
+                        bot, method, timeout=request_timeout
+                    )
+                    diag_log(
+                        'TG_SAFE_RETRY ATTEMPT_OK id=%s method=%s attempt=%s duration=%.3fs',
+                        request_id,
+                        method_name,
+                        attempt_no,
+                        time.monotonic() - attempt_started,
+                    )
+                    return attempt_result, None, False
+                except Exception as attempt_exc:
+                    attempt_phases = [name for name, _ in rec.get('phases', [])[phase_offset:]]
+                    attempt_failure_phase = rec.get('failure_phase') or rec.get('last_phase')
+                    attempt_request_bytes = int(rec.get('request_bytes', 0) or 0)
+                    safe_for_next = _is_safe_connection_failure(
+                        attempt_exc,
+                        attempt_phases,
+                        attempt_failure_phase,
+                        attempt_request_bytes,
+                    )
+                    diag_log(
+                        'TG_SAFE_RETRY ATTEMPT_FAILED id=%s method=%s attempt=%s duration=%.3fs '
+                        'exc=%s failure_phase=%s request_bytes=%s safe_for_next=%s',
+                        request_id,
+                        method_name,
+                        attempt_no,
+                        time.monotonic() - attempt_started,
+                        type(attempt_exc).__name__,
+                        attempt_failure_phase,
+                        attempt_request_bytes,
+                        safe_for_next,
+                    )
+                    return None, attempt_exc, safe_for_next
+                finally:
+                    await fresh_session.close()
+
+            async def _delayed_rescue_delivery() -> None:
+                # This is a final, one-shot delivery attempt around the one-minute mark.
+                # It is scheduled only after three failures that all happened before any
+                # request bytes were sent, so it cannot duplicate an already submitted message.
+                rescue_parent_id = request_id
+                try:
+                    diag_log(
+                        'TG_SAFE_RESCUE WAIT id=%s method=%s chat=%s order=%s step=%s delay=%.1fs',
+                        rescue_parent_id,
+                        method_name,
+                        chat_id,
+                        order_id,
+                        step,
+                        TG_SAFE_RESCUE_RETRY_DELAY_SEC,
+                    )
+                    await asyncio.sleep(TG_SAFE_RESCUE_RETRY_DELAY_SEC)
+
+                    # Rescue only active order prompts. If the user returned to the menu,
+                    # cancelled, restarted or somehow advanced, the old prompt is stale.
+                    if method_name != 'sendMessage' or not isinstance(chat_id, int) or not order_id:
+                        diag_log(
+                            'TG_SAFE_RESCUE SKIPPED id=%s method=%s reason=no_active_order_context',
+                            rescue_parent_id,
+                            method_name,
+                        )
+                        return
+                    current_st = state_by_chat.get(chat_id)
+                    if (
+                        current_st is None
+                        or str(getattr(current_st, 'order_id', '') or '') != order_id
+                        or str(getattr(current_st, 'step', '') or '') != step
+                        or bool(getattr(current_st, 'finalized', False))
+                    ):
+                        diag_log(
+                            'TG_SAFE_RESCUE SKIPPED id=%s method=%s chat=%s order=%s step=%s '
+                            'reason=context_changed current_order=%s current_step=%s finalized=%s',
+                            rescue_parent_id,
+                            method_name,
+                            chat_id,
+                            order_id,
+                            step,
+                            str(getattr(current_st, 'order_id', '') or '') if current_st else '',
+                            str(getattr(current_st, 'step', '') or '') if current_st else '',
+                            bool(getattr(current_st, 'finalized', False)) if current_st else False,
+                        )
+                        return
+
+                    rescue_id = _tg_new_request_id()
+                    rescue_started = time.monotonic()
+                    rescue_rec = {
+                        'id': rescue_id,
+                        'method': method_name,
+                        'chat_id': chat_id,
+                        'order_id': order_id,
+                        'step': step,
+                        'started': rescue_started,
+                        'last_phase': 'rescue_call_start',
+                        'last_phase_at': rescue_started,
+                        'max_event_loop_lag': 0.0,
+                        'task': asyncio.current_task(),
+                        'verbose': True,
+                        'timeout': request_timeout,
+                        'request_chunks': 0,
+                        'request_bytes': 0,
+                        'response_chunks': 0,
+                        'response_bytes': 0,
+                    }
+                    _TG_ACTIVE_REQUESTS[rescue_id] = rescue_rec
+                    rescue_token = _TG_REQUEST_ID.set(rescue_id)
+                    rescue_session = DiagnosticAiohttpSession()
+                    rescue_session._connector_init = dict(getattr(rescue_session, '_connector_init', {}) or {})
+                    rescue_session._connector_init['force_close'] = True
+                    try:
+                        diag_log(
+                            'TG_SAFE_RESCUE ATTEMPT_START id=%s parent_id=%s method=%s chat=%s order=%s step=%s',
+                            rescue_id,
+                            rescue_parent_id,
+                            method_name,
+                            chat_id,
+                            order_id,
+                            step,
+                        )
+                        rescue_result = await super(DiagnosticAiohttpSession, rescue_session).make_request(
+                            bot, method, timeout=request_timeout
+                        )
+                        diag_log(
+                            'TG_SAFE_RESCUE ATTEMPT_OK id=%s parent_id=%s method=%s duration=%.3fs '
+                            'message_id=%s',
+                            rescue_id,
+                            rescue_parent_id,
+                            method_name,
+                            time.monotonic() - rescue_started,
+                            getattr(rescue_result, 'message_id', None),
+                        )
+                    except Exception as rescue_exc:
+                        diag_log(
+                            'TG_SAFE_RESCUE ATTEMPT_FAILED id=%s parent_id=%s method=%s duration=%.3fs '
+                            'exc=%s failure_phase=%s request_bytes=%s error=%s',
+                            rescue_id,
+                            rescue_parent_id,
+                            method_name,
+                            time.monotonic() - rescue_started,
+                            type(rescue_exc).__name__,
+                            rescue_rec.get('failure_phase') or rescue_rec.get('last_phase'),
+                            int(rescue_rec.get('request_bytes', 0) or 0),
+                            _tg_safe_error_text(rescue_exc),
+                        )
+                    finally:
+                        await rescue_session.close()
+                        _TG_REQUEST_ID.reset(rescue_token)
+                        _TG_ACTIVE_REQUESTS.pop(rescue_id, None)
+                except asyncio.CancelledError:
+                    diag_log('TG_SAFE_RESCUE CANCELLED id=%s method=%s', rescue_parent_id, method_name)
+                except Exception:
+                    logger.exception(
+                        'TG_SAFE_RESCUE INTERNAL_ERROR id=%s method=%s chat=%s order=%s step=%s',
+                        rescue_parent_id,
+                        method_name,
+                        chat_id,
+                        order_id,
+                        step,
+                    )
+
             try:
                 result = await super().make_request(bot, method, timeout=request_timeout)
             except Exception as first_exc:
-                phases = [name for name, _ in rec.get('phases', [])]
-                failure_phase = rec.get('failure_phase') or rec.get('last_phase')
-                root = getattr(first_exc, '__cause__', None) or getattr(first_exc, '__context__', None)
-                safe_retry = (
-                    method_name != 'getUpdates'
-                    and (isinstance(root, (asyncio.TimeoutError, TimeoutError)) or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError)))
-                    and failure_phase in {'connection_create_start', 'dns_start', 'dns_end', 'dns_cache_hit', 'dns_cache_miss'}
-                    and int(rec.get('request_bytes', 0) or 0) == 0
-                    and 'request_headers_sent' not in phases
-                    and 'request_body_first_chunk' not in phases
+                first_phases = [name for name, _ in rec.get('phases', [])]
+                first_failure_phase = rec.get('failure_phase') or rec.get('last_phase')
+                first_request_bytes = int(rec.get('request_bytes', 0) or 0)
+                safe_retry = _is_safe_connection_failure(
+                    first_exc,
+                    first_phases,
+                    first_failure_phase,
+                    first_request_bytes,
                 )
                 if not safe_retry:
-                    diag_log('TG_SAFE_RETRY DENIED id=%s method=%s failure_phase=%s request_bytes=%s', request_id, method_name, failure_phase, rec.get('request_bytes', 0))
+                    diag_log(
+                        'TG_SAFE_RETRY DENIED id=%s method=%s failure_phase=%s request_bytes=%s',
+                        request_id,
+                        method_name,
+                        first_failure_phase,
+                        first_request_bytes,
+                    )
                     raise
-                diag_log('TG_SAFE_RETRY ALLOWED id=%s method=%s failure_phase=%s request_bytes=0', request_id, method_name, failure_phase)
-                fresh_session = AiohttpSession()
-                fresh_session._connector_init = dict(getattr(fresh_session, '_connector_init', {}) or {})
-                fresh_session._connector_init['force_close'] = True
-                retry_started = time.monotonic()
-                try:
-                    diag_log('TG_SAFE_RETRY START id=%s method=%s fresh_connection=True', request_id, method_name)
-                    result = await fresh_session.make_request(bot, method, timeout=request_timeout)
-                    diag_log('TG_SAFE_RETRY OK id=%s method=%s duration=%.3fs', request_id, method_name, time.monotonic() - retry_started)
-                except Exception as retry_exc:
-                    diag_log('TG_SAFE_RETRY FAILED id=%s method=%s duration=%.3fs exc=%s', request_id, method_name, time.monotonic() - retry_started, type(retry_exc).__name__)
-                    raise retry_exc from first_exc
-                finally:
-                    await fresh_session.close()
+
+                diag_log(
+                    'TG_SAFE_RETRY ALLOWED id=%s method=%s failure_phase=%s request_bytes=0',
+                    request_id,
+                    method_name,
+                    first_failure_phase,
+                )
+
+                result, second_exc, safe_for_third = await _fresh_connection_attempt(2)
+                if second_exc is not None:
+                    if not safe_for_third:
+                        raise second_exc from first_exc
+
+                    diag_log(
+                        'TG_SAFE_RETRY THIRD_WAIT id=%s method=%s delay=%.1fs',
+                        request_id,
+                        method_name,
+                        TG_SAFE_THIRD_RETRY_DELAY_SEC,
+                    )
+                    await asyncio.sleep(TG_SAFE_THIRD_RETRY_DELAY_SEC)
+                    result, third_exc, safe_for_rescue = await _fresh_connection_attempt(3)
+                    if third_exc is not None:
+                        if safe_for_rescue:
+                            rescue_task = asyncio.create_task(_delayed_rescue_delivery())
+                            _TG_RESCUE_TASKS.add(rescue_task)
+                            rescue_task.add_done_callback(_TG_RESCUE_TASKS.discard)
+                            diag_log(
+                                'TG_SAFE_RESCUE SCHEDULED id=%s method=%s chat=%s order=%s step=%s delay=%.1fs',
+                                request_id,
+                                method_name,
+                                chat_id,
+                                order_id,
+                                step,
+                                TG_SAFE_RESCUE_RETRY_DELAY_SEC,
+                            )
+                        else:
+                            diag_log(
+                                'TG_SAFE_RESCUE DENIED id=%s method=%s reason=third_attempt_may_have_sent_bytes',
+                                request_id,
+                                method_name,
+                            )
+                        raise third_exc from second_exc
             duration = time.monotonic() - started
             if verbose:
                 diag_log(
