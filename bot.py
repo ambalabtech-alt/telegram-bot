@@ -552,8 +552,8 @@ def _append_row_impl(values: Dict[str, str]) -> int:
         # Hard write from column A to AE. This cannot start in S/U or any column to the right.
         _retry_sheets(
             ws.update,
-            f'A{target_row}:AE{target_row}',
-            [row_values],
+            values=[row_values],
+            range_name=f'A{target_row}:AE{target_row}',
             value_input_option='USER_ENTERED'
         )
 
@@ -4260,8 +4260,8 @@ def upsert_poll_response(row: list) -> None:
             if str(existing_poll_id) == poll_id and str(existing_chat_id) == chat_id:
                 _retry_sheets(
                     ws_resp.update,
-                    f'A{idx}:H{idx}',
-                    [row],
+                    values=[row],
+                    range_name=f'A{idx}:H{idx}',
                     value_input_option='USER_ENTERED'
                 )
                 return
