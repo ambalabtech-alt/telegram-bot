@@ -2776,18 +2776,44 @@ async def price_btn(msg: Message):
 async def contact_tech(msg: Message):
     await _clear_inline_markup(msg)
     await _silent_autostart_on_first_menu_click(msg)
-    try:
-        if WORK_CONTACT_CHAT_ID:
-            doctor = msg.from_user.full_name if msg.from_user else ''
-            uname = f'@{msg.from_user.username}' if msg.from_user and msg.from_user.username else ''
-            await bot.send_message(
-                WORK_CONTACT_CHAT_ID,
-                f"Лікар просить зв'язатися: {doctor} {uname} (chat_id: {msg.chat.id})"
+
+    doctor = msg.from_user.full_name if msg.from_user else ''
+    username = msg.from_user.username if msg.from_user else None
+
+    if username:
+        try:
+            if WORK_CONTACT_CHAT_ID:
+                await bot.send_message(
+                    WORK_CONTACT_CHAT_ID,
+                    f"Лікар {doctor} хоче зв'язатися з техніком. Telegram: @{username}"
+                )
+        except Exception as e:
+            logger.warning('Cannot ping work contact: %s', e)
+
+        _reset_new_order_click_count(msg.chat.id, 'contact_tech_main_menu')
+        await msg.answer(
+            "Передали повідомлення техніку. Він зв'яжеться з Вами найближчим часом.",
+            reply_markup=main_kb()
+        )
+        return
+
+    ikb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text='Написати в AmbaLab',
+                url='https://t.me/AmbaLab_laboratory'
             )
-    except Exception as e:
-        logger.warning('Cannot ping work contact: %s', e)
+        ]]
+    )
+    resp = await msg.answer(
+        'Напишіть нам, будь ласка 👇',
+        reply_markup=ikb
+    )
+    st = state_by_chat.get(msg.chat.id)
+    if st:
+        st.last_inline_msg_id = resp.message_id
+
     _reset_new_order_click_count(msg.chat.id, 'contact_tech_main_menu')
-    await msg.answer("Передали повідомлення техніку. Він зв'яжеться з Вами найближчим часом.", reply_markup=main_kb())
 
 @dp.message(F.text == '🧾 Зробити замовлення')
 async def new_order(msg: Message):
