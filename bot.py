@@ -1479,7 +1479,7 @@ def _prev_step(st: OrderState) -> tuple[str, str]:
     if dname == 'saved_pick':
         return ('np_menu', 'Доставити замовлення Новою Поштою. Оберіть пункт меню:')
     if sname == 'await_notes':
-        return ('await_notes_choice', 'Хочете додати текстові пояснення або голосове повідомлення?')
+        return ('await_notes_choice', "Напишіть Ваш план лікування, всі важливі деталі щодо апарату та всі потрібні додаткові елементи (гачки, відростки, замки на кільцях).\n\n<b>ОБОВ'ЯЗКОВО</b> вкажіть у наряді, чи потрібні Вам інструменти в оренду: повний комплект, викрутка, гільзи, скан-абатменти або не потрібні.\n\nМаєте додаткові пояснення або уточнення?\n<b>Оберіть ТАК чи НІ.</b>")
     if sname == 'await_notes_choice':
         return ('choose_files_method', 'Оберіть спосіб передачі файлів:')
     if sname == 'choose_files_method':
@@ -2905,7 +2905,7 @@ async def ask_notes(msg: Message, st: OrderState):
     st.done_lock = False
     st.step = 'await_notes_choice'
     await save_bot_state_async(msg.chat.id, st)
-    await msg.answer('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', reply_markup=notes_yesno_kb())
+    await msg.answer("Напишіть Ваш план лікування, всі важливі деталі щодо апарату та всі потрібні додаткові елементи (гачки, відростки, замки на кільцях).\n\n<b>ОБОВ'ЯЗКОВО</b> вкажіть у наряді, чи потрібні Вам інструменти в оренду: повний комплект, викрутка, гільзи, скан-абатменти або не потрібні.\n\nМаєте додаткові пояснення або уточнення?\n<b>Оберіть ТАК чи НІ.</b>", reply_markup=notes_yesno_kb(), parse_mode='HTML')
 
 async def finalize_order(msg: Message, st: OrderState):
     diag_log('finalize.start chat=%s order=%s row=%s step=%s', msg.chat.id, getattr(st, 'order_id', None), getattr(st, 'sheet_row', None), getattr(st, 'step', None))
@@ -3177,7 +3177,7 @@ async def flow(msg: Message):
             st.step = prev_step
             st.delivery_step = ''
             if prev_step == 'await_notes_choice':
-                await msg.answer(hint, reply_markup=notes_yesno_kb())
+                await msg.answer(hint, reply_markup=notes_yesno_kb(), parse_mode='HTML')
             elif prev_step == 'np_menu':
                 has_saved = bool(np_profiles_list(msg.chat.id))
                 await _clear_inline_markup(msg)
@@ -3239,7 +3239,7 @@ async def flow(msg: Message):
                         files_aux_kb(),
                     ),
                     'email_wait_done': ('Перевірте e-mail і тему повідомлення (скопіюйте й надішліть). Коли завершите - натисніть «✅ Готово».', done_kb()),
-                    'await_notes_choice': ('Хочете додати текстові пояснення або голосове повідомлення? Оберіть ТАК чи НІ', notes_yesno_kb()),
+                    'await_notes_choice': ("Напишіть Ваш план лікування, всі важливі деталі щодо апарату та всі потрібні додаткові елементи (гачки, відростки, замки на кільцях).\n\n<b>ОБОВ'ЯЗКОВО</b> вкажіть у наряді, чи потрібні Вам інструменти в оренду: повний комплект, викрутка, гільзи, скан-абатменти або не потрібні.\n\nМаєте додаткові пояснення або уточнення?\n<b>Оберіть ТАК чи НІ.</b>", notes_yesno_kb()),
                     'await_notes': (
                         '💬 <b>Надішліть текстові або голосові повідомлення</b>\n\nПісля першого збереженого повідомлення зʼявиться кнопка «✅ Готово».',
                         bottom_nav_kb(),
