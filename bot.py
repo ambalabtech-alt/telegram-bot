@@ -1,4 +1,3 @@
-
 import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
@@ -3890,37 +3889,51 @@ async def np_pick_cb(q: CallbackQuery):
         row = int(q.data.split(':', 1)[1])
     except Exception:
         return await q.answer()
-    ws2 = np_profiles_ws()
-    head = np_head(ws2)
-    row_vals = []
-    for i in range(3):
-        try:
-            row_vals = ws2.row_values(row)
-            break
-        except Exception as e:
-            if 'Quota exceeded' in str(e) or '429' in str(e):
-                time.sleep(1 * 2 ** i)
-                continue
-            raise
+
+    # Одразу підтверджуємо натискання Telegram і показуємо користувачу,
+    # що вибрана збережена адреса вже обробляється.
+    await q.answer()
+    progress_task = asyncio.create_task(
+        q.message.answer('⏳ Підставляю дані доставки…')
+    )
+
+    # Читання Лист2 синхронне, тому виконуємо його в окремому потоці.
+    # Поки Google Sheets повертає рядок, повідомлення вище надсилається паралельно.
+    def _load_saved_np_row():
+        ws2 = np_profiles_ws()
+        head = np_head(ws2)
+        row_vals = []
+        for i in range(3):
+            try:
+                row_vals = ws2.row_values(row)
+                break
+            except Exception as e:
+                if 'Quota exceeded' in str(e) or '429' in str(e):
+                    time.sleep(1 * 2 ** i)
+                    continue
+                raise
+        return head, row_vals
+
+    head, row_vals = await asyncio.to_thread(_load_saved_np_row)
+    await progress_task
 
     def v(k: str) -> str:
         c = head.get(k)
         return row_vals[c - 1] if c and c - 1 < len(row_vals) else ''
     phone_val = normalize_ua_phone(v('recipient_phone')) or v('recipient_phone')
-    if not await _safe_set_cell(st.sheet_row, 'recipient_name', v('recipient_name'), q.message): return await q.answer()
-    if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return await q.answer()
-    if not await _safe_set_cell(st.sheet_row, 'np_city_name', v('np_city_name'), q.message): return await q.answer()
-    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', v('np_warehouse_desc'), q.message): return await q.answer()
+    if not await _safe_set_cell(st.sheet_row, 'recipient_name', v('recipient_name'), q.message): return
+    if not await _safe_set_cell(st.sheet_row, 'recipient_phone', phone_val, q.message): return
+    if not await _safe_set_cell(st.sheet_row, 'np_city_name', v('np_city_name'), q.message): return
+    if not await _safe_set_cell(st.sheet_row, 'np_warehouse_desc', v('np_warehouse_desc'), q.message): return
     if head.get('np_city_ref'):
-        if not await _safe_set_cell(st.sheet_row, 'np_city_ref', v('np_city_ref'), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_city_ref', v('np_city_ref'), q.message): return
         st.np_city_ref = v('np_city_ref')
     if head.get('np_warehouse_ref'):
-        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', v('np_warehouse_ref'), q.message): return await q.answer()
+        if not await _safe_set_cell(st.sheet_row, 'np_warehouse_ref', v('np_warehouse_ref'), q.message): return
     await q.message.answer('Дані доставки підставлено.')
     await q.message.answer('Оберіть спосіб передачі файлів:', reply_markup=files_method_kb())
     st.delivery_step = ''
     st.step = 'choose_files_method'
-    await q.answer()
 
 @dp.callback_query(F.data.startswith('np_city_pick:'))
 async def np_city_pick_cb(q: CallbackQuery):
