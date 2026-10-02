@@ -1,3 +1,4 @@
+
 import time
 import json
 from google.oauth2.service_account import Credentials as SACreds
@@ -3890,15 +3891,12 @@ async def np_pick_cb(q: CallbackQuery):
     except Exception:
         return await q.answer()
 
-    # Одразу підтверджуємо натискання Telegram і показуємо користувачу,
-    # що вибрана збережена адреса вже обробляється.
+    # Одразу підтверджуємо натискання Telegram.
     await q.answer()
-    progress_task = asyncio.create_task(
-        q.message.answer('⏳ Підставляю дані доставки…')
-    )
 
-    # Читання Лист2 синхронне, тому виконуємо його в окремому потоці.
-    # Поки Google Sheets повертає рядок, повідомлення вище надсилається паралельно.
+    # Читання Лист2 синхронне, тому запускаємо його в окремому потоці.
+    # Поки Google Sheets читає рядок, паралельно надсилаємо користувачу
+    # повідомлення, що вибрана збережена адреса вже обробляється.
     def _load_saved_np_row():
         ws2 = np_profiles_ws()
         head = np_head(ws2)
@@ -3914,8 +3912,9 @@ async def np_pick_cb(q: CallbackQuery):
                 raise
         return head, row_vals
 
-    head, row_vals = await asyncio.to_thread(_load_saved_np_row)
-    await progress_task
+    row_task = asyncio.create_task(asyncio.to_thread(_load_saved_np_row))
+    await q.message.answer('⏳ Підставляю дані доставки…')
+    head, row_vals = await row_task
 
     def v(k: str) -> str:
         c = head.get(k)
